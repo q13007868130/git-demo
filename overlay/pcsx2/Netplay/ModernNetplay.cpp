@@ -3,20 +3,19 @@
 
 #include "Netplay/ModernNetplay.h"
 
-#include "Config.h"
 #include "Counters.h"
-#include "GS/GSXXH.h"
-#include "IopMem.h"
-#include "Memory.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -35,18 +34,11 @@ namespace
 	using InputFrame = std::array<std::uint8_t, 6>;
 	constexpr std::uint32_t HELLO_MAGIC = 0x50324E50; // P2NP
 	constexpr std::uint32_t FRAME_MAGIC = 0x46524D45; // FRME
-	constexpr std::uint32_t PROTOCOL_VERSION = 2;
+	constexpr std::uint32_t PROTOCOL_VERSION = 1; // Restore the proven v0.1 wire/input semantics.
 	constexpr std::uint16_t DEFAULT_PORT = 27886;
 	constexpr int RECEIVE_TIMEOUT_SECONDS = 10;
-	constexpr std::uint32_t STATE_HASH_INTERVAL = 120;
+	constexpr std::uint32_t LOG_FRAME_INTERVAL = 120;
 	constexpr InputFrame NEUTRAL_FRAME = {0xff, 0xff, 0x7f, 0x7f, 0x7f, 0x7f};
-
-	struct InputSample
-	{
-		InputFrame input = NEUTRAL_FRAME;
-		std::uint32_t emu_frame = 0;
-		std::uint64_t state_hash = 0;
-	};
 
 	enum class Role : std::uint32_t
 	{
@@ -66,25 +58,6 @@ namespace
 		std::uint32_t value;
 		std::memcpy(&value, src, sizeof(value));
 		return ntohl(value);
-	}
-
-	void WriteU64(std::uint8_t* dst, std::uint64_t value)
-	{
-		WriteU32(dst, static_cast<std::uint32_t>(value >> 32));
-		WriteU32(dst + 4, static_cast<std::uint32_t>(value));
-	}
-
-	std::uint64_t ReadU64(const std::uint8_t* src)
-	{
-		return (static_cast<std::uint64_t>(ReadU32(src)) << 32) |
-			static_cast<std::uint64_t>(ReadU32(src + 4));
-	}
-
-	std::uint64_t HashVmMemory()
-	{
-		const std::uint64_t ee_hash = GSXXH3_64bits(eeMem->Main, Ps2MemSize::ExposedRam);
-		const std::uint64_t iop_hash = GSXXH3_64bits(iopMem->Main, Ps2MemSize::ExposedIopRam);
-		return ee_hash ^ (iop_hash + 0x9e3779b97f4a7c15ULL + (ee_hash << 6) + (ee_hash >> 2));
 	}
 
 	bool SendAll(SOCKET socket, const void* data, std::size_t size)
@@ -121,6 +94,14 @@ namespace
 		Session()
 		{
 			ReadConfiguration();
+			if (m_role != Role::Disabled)
+			{
+				OpenLog();
+				Log("session configured: role=%s host=%s port=%u delay=%u protocol=%u",
+					RoleName(), m_host.c_str(), static_cast<unsigned>(m_port),
+					static_cast<unsigned>(m_delay.load()), static_cast<unsigned>(PROTOCOL_VERSION));
+				Log("v0.4 stability mode: v0.1 controller lockstep restored; VSync/hash checks are no longer disconnect conditions");
+			}
 		}
 
 		~Session()
@@ -133,6 +114,42 @@ namespace
 			return m_role != Role::Disabled;
 		}
 
+		void StartSessionAsync()
+		{
+			if (!IsConfigured() || m_connected.load(std::memory_order_acquire) ||
+				m_failed.load(std::memory_order_acquire) || m_stop_requested.load(std::memory_order_acquire))
+				return;
+
+			bool expected = false;
+			if (!m_connect_worker_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+				return;
+
+			Log("lobby connection worker started");
+			m_connector = std::thread([this]() {
+				EnsureConnected();
+			});
+		}
+
+		StatusSnapshot GetStatusSnapshot() const
+		{
+			StatusSnapshot out;
+			out.configured = IsConfigured();
+			out.connecting = m_connecting.load(std::memory_order_acquire);
+			out.connected = m_connected.load(std::memory_order_acquire);
+			out.failed = m_failed.load(std::memory_order_acquire);
+			out.player_count = out.configured ? (out.connected ? 2u : 1u) : 0u;
+			out.delay = m_delay.load(std::memory_order_acquire);
+			out.port = m_port;
+			out.role = RoleName();
+			{
+				std::lock_guard<std::mutex> lock(m_state_mutex);
+				out.peer = m_peer;
+				out.last_error = m_last_error;
+				out.log_path = m_log_path;
+			}
+			return out;
+		}
+
 		std::uint8_t HandlePadResponse(std::uint8_t unified_slot, std::uint32_t command_index, std::uint8_t local_value)
 		{
 			if (m_role == Role::Disabled || command_index < 3 || command_index > 8)
@@ -140,9 +157,8 @@ namespace
 
 			const std::size_t input_index = static_cast<std::size_t>(command_index - 3);
 
-			// Port 1 is the local physical-input source on both peers. On the client its
-			// bytes are captured before being replaced with host data, then replayed as
-			// virtual controller port 2. This means the user only needs one local pad.
+			// Keep the exact v0.1 mapping: port 1 captures the one physical pad on both
+			// peers, host input is replayed as P1 and client input as virtual P2.
 			if (unified_slot == 0 && command_index == 3)
 			{
 				if (!BeginPadPoll())
@@ -154,7 +170,7 @@ namespace
 
 			if (unified_slot == 0)
 			{
-				m_capture.input[input_index] = local_value;
+				m_capture[input_index] = local_value;
 				return (m_role == Role::Host) ? m_local_output[input_index] : m_remote_output[input_index];
 			}
 
@@ -166,9 +182,18 @@ namespace
 
 		void Stop()
 		{
+			if (m_stop_requested.exchange(true, std::memory_order_acq_rel))
+				return;
+
+			Log("session shutdown requested");
 			m_running.store(false, std::memory_order_release);
 			m_connected.store(false, std::memory_order_release);
+			m_connecting.store(false, std::memory_order_release);
 			m_remote_cv.notify_all();
+
+			const SOCKET listener = m_listener.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
+			if (listener != INVALID_SOCKET)
+				closesocket(listener);
 
 			SOCKET socket = INVALID_SOCKET;
 			{
@@ -176,13 +201,14 @@ namespace
 				socket = m_socket;
 				m_socket = INVALID_SOCKET;
 			}
-
 			if (socket != INVALID_SOCKET)
 			{
 				shutdown(socket, SD_BOTH);
 				closesocket(socket);
 			}
 
+			if (m_connector.joinable() && m_connector.get_id() != std::this_thread::get_id())
+				m_connector.join();
 			if (m_receiver.joinable() && m_receiver.get_id() != std::this_thread::get_id())
 				m_receiver.join();
 
@@ -191,9 +217,22 @@ namespace
 				WSACleanup();
 				m_winsock_started = false;
 			}
+
+			Log("session stopped");
+			CloseLog();
 		}
 
 	private:
+		const char* RoleName() const
+		{
+			switch (m_role)
+			{
+				case Role::Host: return "host";
+				case Role::Client: return "client";
+				default: return "disabled";
+			}
+		}
+
 		void ReadConfiguration()
 		{
 			const char* mode = std::getenv("PCSX2_NETPLAY_MODE");
@@ -218,11 +257,66 @@ namespace
 			}
 
 			if (const char* delay = std::getenv("PCSX2_NETPLAY_DELAY"))
-				m_delay = static_cast<std::uint32_t>(std::clamp(std::atoi(delay), 1, 12));
+				m_delay.store(static_cast<std::uint32_t>(std::clamp(std::atoi(delay), 1, 12)), std::memory_order_release);
+		}
 
-			std::fprintf(stderr, "[ModernNetplay] configured: mode=%s port=%u delay=%u host=%s protocol=%u\n",
-				(m_role == Role::Host) ? "host" : "client", static_cast<unsigned>(m_port),
-				static_cast<unsigned>(m_delay), m_host.c_str(), static_cast<unsigned>(PROTOCOL_VERSION));
+		void OpenLog()
+		{
+			std::error_code ec;
+			const std::filesystem::path dir = std::filesystem::path("logs") / "netplay";
+			std::filesystem::create_directories(dir, ec);
+
+			std::time_t now = std::time(nullptr);
+			std::tm local_tm{};
+			localtime_s(&local_tm, &now);
+			char stamp[32]{};
+			std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local_tm);
+
+			const std::string filename = std::string("netplay-") + stamp + "-" + RoleName() + ".log";
+			const std::filesystem::path file_path = dir / filename;
+			FILE* file = nullptr;
+			if (fopen_s(&file, file_path.string().c_str(), "wb") == 0)
+				m_log_file = file;
+
+			std::filesystem::path absolute_path = std::filesystem::absolute(file_path, ec);
+			std::lock_guard<std::mutex> lock(m_state_mutex);
+			m_log_path = ec ? file_path.string() : absolute_path.string();
+		}
+
+		void CloseLog()
+		{
+			std::lock_guard<std::mutex> lock(m_log_mutex);
+			if (m_log_file)
+			{
+				std::fclose(m_log_file);
+				m_log_file = nullptr;
+			}
+		}
+
+		void Log(const char* format, ...) const
+		{
+			char message[2048]{};
+			va_list args;
+			va_start(args, format);
+			std::vsnprintf(message, sizeof(message), format, args);
+			va_end(args);
+
+			const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - m_session_started).count();
+
+			std::lock_guard<std::mutex> lock(m_log_mutex);
+			std::fprintf(stderr, "[ModernNetplay +%lldms] %s\n", static_cast<long long>(elapsed), message);
+			if (m_log_file)
+			{
+				std::fprintf(m_log_file, "[+%lldms] %s\r\n", static_cast<long long>(elapsed), message);
+				std::fflush(m_log_file);
+			}
+		}
+
+		void SetLastError(const char* message)
+		{
+			std::lock_guard<std::mutex> lock(m_state_mutex);
+			m_last_error = message ? message : "unknown error";
 		}
 
 		bool BeginPadPoll()
@@ -230,109 +324,98 @@ namespace
 			if (!EnsureConnected())
 				return false;
 
-			// Commit the pad sample captured by the preceding poll. In protocol v2 each
-			// sample also carries PCSX2's canonical VSync frame number and a periodic
-			// VM-memory hash. This lets us stop on the first real divergence instead of
-			// silently pairing unrelated pad polls for minutes.
+			// This block intentionally mirrors v0.1. The v0.3 regression came from
+			// treating absolute g_FrameCount/hash diagnostics as fatal even though two
+			// independently booted peers can have a harmless constant VSync offset.
 			if (m_have_capture)
 			{
-				m_local_frames[m_poll_frame] = m_capture;
-				if (!SendFrame(m_poll_frame, m_capture))
+				m_local_frames[m_frame] = m_capture;
+				if (!SendFrame(m_frame, m_capture))
 				{
 					Fail("failed to send controller frame");
 					return false;
 				}
-				++m_poll_frame;
+				++m_frame;
 			}
 			else
 			{
 				m_have_capture = true;
 			}
 
-			m_capture.input = NEUTRAL_FRAME;
-			m_capture.emu_frame = static_cast<std::uint32_t>(g_FrameCount);
-			m_capture.state_hash = 0;
-			if (m_capture.emu_frame >= m_next_hash_emu_frame)
-			{
-				m_capture.state_hash = HashVmMemory();
-				m_next_hash_emu_frame = m_capture.emu_frame + STATE_HASH_INTERVAL;
-			}
-
+			m_capture = NEUTRAL_FRAME;
 			m_local_output = NEUTRAL_FRAME;
 			m_remote_output = NEUTRAL_FRAME;
 
-			if (m_poll_frame >= m_delay)
+			if (m_frame >= m_delay.load(std::memory_order_acquire))
 			{
-				const std::uint32_t source_frame = m_poll_frame - m_delay;
+				const std::uint32_t source_frame = m_frame - m_delay.load(std::memory_order_acquire);
 				const auto local = m_local_frames.find(source_frame);
 				if (local == m_local_frames.end())
 				{
 					Fail("local delayed frame is missing");
 					return false;
 				}
+				m_local_output = local->second;
 
-				InputSample remote;
-				if (!WaitForRemoteFrame(source_frame, &remote))
+				if (!WaitForRemoteFrame(source_frame, &m_remote_output))
 				{
 					Fail("timed out waiting for peer controller frame");
 					return false;
 				}
 
-				if (local->second.emu_frame != remote.emu_frame)
-				{
-					std::fprintf(stderr,
-						"[ModernNetplay] DESYNC: input timeline mismatch at poll=%u local-vsync=%u peer-vsync=%u\n",
-						static_cast<unsigned>(source_frame), static_cast<unsigned>(local->second.emu_frame),
-						static_cast<unsigned>(remote.emu_frame));
-					Fail("emulation frame timeline diverged");
-					return false;
-				}
-
-				if (local->second.state_hash != remote.state_hash &&
-					(local->second.state_hash != 0 || remote.state_hash != 0))
-				{
-					std::fprintf(stderr,
-						"[ModernNetplay] DESYNC: VM state mismatch at poll=%u vsync=%u local=%016llx peer=%016llx\n",
-						static_cast<unsigned>(source_frame), static_cast<unsigned>(local->second.emu_frame),
-						static_cast<unsigned long long>(local->second.state_hash),
-						static_cast<unsigned long long>(remote.state_hash));
-					Fail("virtual machine state hash diverged");
-					return false;
-				}
-
-				m_local_output = local->second.input;
-				m_remote_output = remote.input;
+				if ((source_frame % LOG_FRAME_INTERVAL) == 0)
+					LogFrameSummary(source_frame, m_local_output, m_remote_output);
 			}
 
 			PruneFrames();
 			return true;
 		}
 
+		void LogFrameSummary(std::uint32_t frame, const InputFrame& local, const InputFrame& remote)
+		{
+			Log("SYNC poll=%u vsync=%llu delay=%u wait_ms=%u local=%02x%02x%02x%02x%02x%02x remote=%02x%02x%02x%02x%02x%02x",
+				static_cast<unsigned>(frame), static_cast<unsigned long long>(g_FrameCount),
+				static_cast<unsigned>(m_delay.load(std::memory_order_acquire)),
+				static_cast<unsigned>(m_last_wait_ms.load(std::memory_order_acquire)),
+				static_cast<unsigned>(local[0]), static_cast<unsigned>(local[1]), static_cast<unsigned>(local[2]),
+				static_cast<unsigned>(local[3]), static_cast<unsigned>(local[4]), static_cast<unsigned>(local[5]),
+				static_cast<unsigned>(remote[0]), static_cast<unsigned>(remote[1]), static_cast<unsigned>(remote[2]),
+				static_cast<unsigned>(remote[3]), static_cast<unsigned>(remote[4]), static_cast<unsigned>(remote[5]));
+		}
+
 		bool EnsureConnected()
 		{
 			if (m_connected.load(std::memory_order_acquire))
 				return true;
-			if (m_failed.load(std::memory_order_acquire))
+			if (m_failed.load(std::memory_order_acquire) || m_stop_requested.load(std::memory_order_acquire))
 				return false;
 
 			std::lock_guard<std::mutex> connect_lock(m_connect_mutex);
 			if (m_connected.load(std::memory_order_acquire))
 				return true;
-			if (m_failed.load(std::memory_order_acquire))
+			if (m_failed.load(std::memory_order_acquire) || m_stop_requested.load(std::memory_order_acquire))
 				return false;
 
-			WSADATA data{};
-			if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
+			m_connecting.store(true, std::memory_order_release);
+
+			if (!m_winsock_started)
 			{
-				Fail("WSAStartup failed");
-				return false;
+				WSADATA data{};
+				if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
+				{
+					m_connecting.store(false, std::memory_order_release);
+					Fail("WSAStartup failed");
+					return false;
+				}
+				m_winsock_started = true;
 			}
-			m_winsock_started = true;
 
 			SOCKET socket = (m_role == Role::Host) ? AcceptPeer() : ConnectToHost();
 			if (socket == INVALID_SOCKET)
 			{
-				Fail("could not establish TCP connection");
+				m_connecting.store(false, std::memory_order_release);
+				if (!m_stop_requested.load(std::memory_order_acquire))
+					Fail("could not establish TCP connection");
 				return false;
 			}
 
@@ -342,7 +425,9 @@ namespace
 			if (!ExchangeHello(socket))
 			{
 				closesocket(socket);
-				Fail("Netplay handshake failed");
+				m_connecting.store(false, std::memory_order_release);
+				if (!m_stop_requested.load(std::memory_order_acquire))
+					Fail("Netplay handshake failed");
 				return false;
 			}
 
@@ -352,10 +437,12 @@ namespace
 			}
 			m_running.store(true, std::memory_order_release);
 			m_connected.store(true, std::memory_order_release);
+			m_connecting.store(false, std::memory_order_release);
 			m_receiver = std::thread([this]() { ReceiverLoop(); });
 
-			std::fprintf(stderr, "[ModernNetplay] peer connected; protocol=%u delay=%u\n",
-				static_cast<unsigned>(PROTOCOL_VERSION), static_cast<unsigned>(m_delay));
+			Log("peer connected: protocol=%u delay=%u peer=%s",
+				static_cast<unsigned>(PROTOCOL_VERSION), static_cast<unsigned>(m_delay.load()),
+				GetStatusSnapshot().peer.c_str());
 			return true;
 		}
 
@@ -364,6 +451,8 @@ namespace
 			SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 			if (listener == INVALID_SOCKET)
 				return INVALID_SOCKET;
+
+			m_listener.store(listener, std::memory_order_release);
 
 			BOOL reuse = TRUE;
 			setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
@@ -376,44 +465,93 @@ namespace
 			if (bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR ||
 				listen(listener, 1) == SOCKET_ERROR)
 			{
-				closesocket(listener);
+				if (m_listener.exchange(INVALID_SOCKET, std::memory_order_acq_rel) == listener)
+					closesocket(listener);
 				return INVALID_SOCKET;
 			}
 
-			std::fprintf(stderr, "[ModernNetplay] hosting on TCP port %u; waiting for one peer...\n",
-				static_cast<unsigned>(m_port));
-			SOCKET peer = accept(listener, nullptr, nullptr);
-			closesocket(listener);
+			Log("room open: TCP port %u, players=1/2, waiting for peer", static_cast<unsigned>(m_port));
+
+			SOCKET peer = INVALID_SOCKET;
+			while (!m_stop_requested.load(std::memory_order_acquire))
+			{
+				fd_set read_set;
+				FD_ZERO(&read_set);
+				FD_SET(listener, &read_set);
+				timeval timeout{};
+				timeout.tv_sec = 0;
+				timeout.tv_usec = 250000;
+				const int ready = select(0, &read_set, nullptr, nullptr, &timeout);
+				if (ready > 0 && FD_ISSET(listener, &read_set))
+				{
+					sockaddr_storage peer_address{};
+					int peer_address_length = sizeof(peer_address);
+					peer = accept(listener, reinterpret_cast<sockaddr*>(&peer_address), &peer_address_length);
+					if (peer != INVALID_SOCKET)
+					{
+						char host[NI_MAXHOST]{};
+						if (getnameinfo(reinterpret_cast<const sockaddr*>(&peer_address), peer_address_length,
+							host, sizeof(host), nullptr, 0, NI_NUMERICHOST) == 0)
+						{
+							std::lock_guard<std::mutex> lock(m_state_mutex);
+							m_peer = host;
+						}
+						break;
+					}
+				}
+				else if (ready == SOCKET_ERROR)
+				{
+					break;
+				}
+			}
+
+			if (m_listener.exchange(INVALID_SOCKET, std::memory_order_acq_rel) == listener)
+				closesocket(listener);
 			return peer;
 		}
 
 		SOCKET ConnectToHost()
 		{
-			addrinfo hints{};
-			hints.ai_family = AF_UNSPEC;
-			hints.ai_socktype = SOCK_STREAM;
-			hints.ai_protocol = IPPROTO_TCP;
-
-			addrinfo* result = nullptr;
-			const std::string port = std::to_string(m_port);
-			if (getaddrinfo(m_host.c_str(), port.c_str(), &hints, &result) != 0)
-				return INVALID_SOCKET;
-
-			SOCKET connected = INVALID_SOCKET;
-			for (addrinfo* current = result; current; current = current->ai_next)
+			unsigned attempt = 0;
+			while (!m_stop_requested.load(std::memory_order_acquire))
 			{
-				SOCKET candidate = socket(current->ai_family, current->ai_socktype, current->ai_protocol);
-				if (candidate == INVALID_SOCKET)
-					continue;
-				if (connect(candidate, current->ai_addr, static_cast<int>(current->ai_addrlen)) != SOCKET_ERROR)
+				++attempt;
+				addrinfo hints{};
+				hints.ai_family = AF_UNSPEC;
+				hints.ai_socktype = SOCK_STREAM;
+				hints.ai_protocol = IPPROTO_TCP;
+
+				addrinfo* result = nullptr;
+				const std::string port = std::to_string(m_port);
+				if (getaddrinfo(m_host.c_str(), port.c_str(), &hints, &result) == 0)
 				{
-					connected = candidate;
-					break;
+					SOCKET connected = INVALID_SOCKET;
+					for (addrinfo* current = result; current; current = current->ai_next)
+					{
+						SOCKET candidate = socket(current->ai_family, current->ai_socktype, current->ai_protocol);
+						if (candidate == INVALID_SOCKET)
+							continue;
+						if (connect(candidate, current->ai_addr, static_cast<int>(current->ai_addrlen)) != SOCKET_ERROR)
+						{
+							connected = candidate;
+							break;
+						}
+						closesocket(candidate);
+					}
+					freeaddrinfo(result);
+					if (connected != INVALID_SOCKET)
+					{
+						std::lock_guard<std::mutex> lock(m_state_mutex);
+						m_peer = m_host;
+						return connected;
+					}
 				}
-				closesocket(candidate);
+
+				if (attempt == 1 || (attempt % 10) == 0)
+					Log("joining room: %s:%u, attempt=%u", m_host.c_str(), static_cast<unsigned>(m_port), attempt);
+				std::this_thread::sleep_for(std::chrono::milliseconds(500));
 			}
-			freeaddrinfo(result);
-			return connected;
+			return INVALID_SOCKET;
 		}
 
 		bool ExchangeHello(SOCKET socket)
@@ -422,7 +560,7 @@ namespace
 			WriteU32(outgoing.data() + 0, HELLO_MAGIC);
 			WriteU32(outgoing.data() + 4, PROTOCOL_VERSION);
 			WriteU32(outgoing.data() + 8, static_cast<std::uint32_t>(m_role));
-			WriteU32(outgoing.data() + 12, m_delay);
+			WriteU32(outgoing.data() + 12, m_delay.load(std::memory_order_acquire));
 
 			std::array<std::uint8_t, 16> incoming{};
 			if (m_role == Role::Host)
@@ -436,8 +574,8 @@ namespace
 				!ValidateHello(incoming, Role::Host))
 				return false;
 
-			// Host is authoritative for delay so both virtual machines use the same queue depth.
-			m_delay = std::clamp<std::uint32_t>(ReadU32(incoming.data() + 12), 1, 12);
+			// Host remains authoritative for delay.
+			m_delay.store(std::clamp<std::uint32_t>(ReadU32(incoming.data() + 12), 1, 12), std::memory_order_release);
 			return true;
 		}
 
@@ -447,14 +585,12 @@ namespace
 				ReadU32(hello.data() + 8) == static_cast<std::uint32_t>(expected_role);
 		}
 
-		bool SendFrame(std::uint32_t frame, const InputSample& sample)
+		bool SendFrame(std::uint32_t frame, const InputFrame& input)
 		{
-			std::array<std::uint8_t, 26> packet{};
+			std::array<std::uint8_t, 14> packet{};
 			WriteU32(packet.data() + 0, FRAME_MAGIC);
 			WriteU32(packet.data() + 4, frame);
-			WriteU32(packet.data() + 8, sample.emu_frame);
-			WriteU64(packet.data() + 12, sample.state_hash);
-			std::memcpy(packet.data() + 20, sample.input.data(), sample.input.size());
+			std::memcpy(packet.data() + 8, input.data(), input.size());
 
 			std::lock_guard<std::mutex> lock(m_socket_mutex);
 			return m_socket != INVALID_SOCKET && SendAll(m_socket, packet.data(), packet.size());
@@ -462,9 +598,9 @@ namespace
 
 		void ReceiverLoop()
 		{
-			while (m_running.load(std::memory_order_acquire))
+			while (m_running.load(std::memory_order_acquire) && !m_stop_requested.load(std::memory_order_acquire))
 			{
-				std::array<std::uint8_t, 26> packet{};
+				std::array<std::uint8_t, 14> packet{};
 				SOCKET socket;
 				{
 					std::lock_guard<std::mutex> lock(m_socket_mutex);
@@ -474,15 +610,16 @@ namespace
 					break;
 
 				if (ReadU32(packet.data() + 0) != FRAME_MAGIC)
+				{
+					SetLastError("invalid Netplay packet magic");
 					break;
+				}
 
-				InputSample sample;
-				sample.emu_frame = ReadU32(packet.data() + 8);
-				sample.state_hash = ReadU64(packet.data() + 12);
-				std::memcpy(sample.input.data(), packet.data() + 20, sample.input.size());
+				InputFrame input{};
+				std::memcpy(input.data(), packet.data() + 8, input.size());
 				{
 					std::lock_guard<std::mutex> lock(m_remote_mutex);
-					m_remote_frames[ReadU32(packet.data() + 4)] = sample;
+					m_remote_frames[ReadU32(packet.data() + 4)] = input;
 				}
 				m_remote_cv.notify_all();
 			}
@@ -490,16 +627,24 @@ namespace
 			m_connected.store(false, std::memory_order_release);
 			m_running.store(false, std::memory_order_release);
 			m_remote_cv.notify_all();
-			std::fprintf(stderr, "[ModernNetplay] peer disconnected\n");
+			if (!m_stop_requested.load(std::memory_order_acquire))
+			{
+				SetLastError("peer disconnected");
+				Log("peer disconnected");
+			}
 		}
 
-		bool WaitForRemoteFrame(std::uint32_t frame, InputSample* output)
+		bool WaitForRemoteFrame(std::uint32_t frame, InputFrame* output)
 		{
+			const auto started = std::chrono::steady_clock::now();
 			std::unique_lock<std::mutex> lock(m_remote_mutex);
 			const bool ready = m_remote_cv.wait_for(lock, std::chrono::seconds(RECEIVE_TIMEOUT_SECONDS), [this, frame]() {
 				return m_remote_frames.find(frame) != m_remote_frames.end() ||
-					!m_connected.load(std::memory_order_acquire);
+					!m_connected.load(std::memory_order_acquire) || m_stop_requested.load(std::memory_order_acquire);
 			});
+			const auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - started).count();
+			m_last_wait_ms.store(static_cast<std::uint32_t>(std::max<long long>(0, wait_ms)), std::memory_order_release);
 			if (!ready)
 				return false;
 
@@ -512,9 +657,9 @@ namespace
 
 		void PruneFrames()
 		{
-			if (m_poll_frame < 180)
+			if (m_frame < 180)
 				return;
-			const std::uint32_t keep_from = m_poll_frame - 120;
+			const std::uint32_t keep_from = m_frame - 120;
 			for (auto it = m_local_frames.begin(); it != m_local_frames.end();)
 				it = (it->first < keep_from) ? m_local_frames.erase(it) : std::next(it);
 			std::lock_guard<std::mutex> lock(m_remote_mutex);
@@ -524,35 +669,49 @@ namespace
 
 		void Fail(const char* message)
 		{
+			SetLastError(message);
 			if (!m_failed.exchange(true, std::memory_order_acq_rel))
-				std::fprintf(stderr, "[ModernNetplay] ERROR: %s (WSA=%d)\n", message, WSAGetLastError());
+				Log("ERROR: %s (WSA=%d)", message, WSAGetLastError());
 			m_connected.store(false, std::memory_order_release);
 			m_running.store(false, std::memory_order_release);
+			m_connecting.store(false, std::memory_order_release);
 			m_remote_cv.notify_all();
 		}
 
 		Role m_role = Role::Disabled;
 		std::string m_host = "127.0.0.1";
 		std::uint16_t m_port = DEFAULT_PORT;
-		std::uint32_t m_delay = 2;
-		std::uint32_t m_poll_frame = 0;
-		std::uint32_t m_next_hash_emu_frame = STATE_HASH_INTERVAL;
+		std::atomic<std::uint32_t> m_delay{2};
+		std::uint32_t m_frame = 0;
 		bool m_have_capture = false;
 		bool m_winsock_started = false;
-		InputSample m_capture{};
+		InputFrame m_capture = NEUTRAL_FRAME;
 		InputFrame m_local_output = NEUTRAL_FRAME;
 		InputFrame m_remote_output = NEUTRAL_FRAME;
-		std::unordered_map<std::uint32_t, InputSample> m_local_frames;
-		std::unordered_map<std::uint32_t, InputSample> m_remote_frames;
+		std::unordered_map<std::uint32_t, InputFrame> m_local_frames;
+		std::unordered_map<std::uint32_t, InputFrame> m_remote_frames;
 		SOCKET m_socket = INVALID_SOCKET;
+		std::atomic<SOCKET> m_listener{INVALID_SOCKET};
 		std::atomic<bool> m_connected{false};
+		std::atomic<bool> m_connecting{false};
 		std::atomic<bool> m_running{false};
 		std::atomic<bool> m_failed{false};
+		std::atomic<bool> m_stop_requested{false};
+		std::atomic<bool> m_connect_worker_started{false};
+		std::atomic<std::uint32_t> m_last_wait_ms{0};
 		std::mutex m_connect_mutex;
 		std::mutex m_socket_mutex;
 		std::mutex m_remote_mutex;
 		std::condition_variable m_remote_cv;
+		std::thread m_connector;
 		std::thread m_receiver;
+		mutable std::mutex m_state_mutex;
+		std::string m_peer;
+		std::string m_last_error;
+		std::string m_log_path;
+		mutable std::mutex m_log_mutex;
+		mutable FILE* m_log_file = nullptr;
+		const std::chrono::steady_clock::time_point m_session_started = std::chrono::steady_clock::now();
 	};
 
 	Session& GetSession()
@@ -567,48 +726,22 @@ bool IsConfigured()
 	return GetSession().IsConfigured();
 }
 
+void StartSessionAsync()
+{
+	GetSession().StartSessionAsync();
+}
+
+StatusSnapshot GetStatusSnapshot()
+{
+	return GetSession().GetStatusSnapshot();
+}
+
 void ApplyDeterministicConfig()
 {
-	if (!GetSession().IsConfigured())
-		return;
-
-	// Classic PCSX2 Online did considerably more than exchange pad bytes: it forced
-	// both emulators onto a conservative deterministic profile. v0.1 omitted that,
-	// which allowed two otherwise-connected VMs to drift after several minutes.
-	EmuConfig.HostFs = false;
-	EmuConfig.EnablePatches = false;
-	EmuConfig.EnableCheats = false;
-	EmuConfig.EnableWideScreenPatches = false;
-	EmuConfig.EnableNoInterlacingPatches = false;
-	EmuConfig.CdvdVerboseReads = false;
-	EmuConfig.CdvdDumpBlocks = false;
-	EmuConfig.EnableGameFixes = true;
-	EmuConfig.Pad.MultitapPort0_Enabled = false;
-	EmuConfig.Pad.MultitapPort1_Enabled = false;
-	EmuConfig.Speedhacks.DisableAll();
-	EmuConfig.Cpu = Pcsx2Config::CpuOptions();
-	EmuConfig.Profiler = Pcsx2Config::ProfilerOptions();
-	EmuConfig.Trace.Enabled = false;
-	EmuConfig.EmulationSpeed.SyncToHostRefreshRate = false;
-	EmuConfig.EmulationSpeed.UseVSyncForTiming = false;
-	EmuConfig.EmulationSpeed.NominalScalar = 1.0f;
-	EmuConfig.GS.SynchronousMTGS = true;
-	EmuConfig.GS.SkipDuplicateFrames = false;
-
-	// Until host-to-client memory-card synchronization is ported, disable all cards
-	// during Netplay. Different card contents can alter unlocks, settings and RNG state
-	// before the first synchronized controller sample.
-	for (Pcsx2Config::McdOptions& card : EmuConfig.Mcd)
-		card.Enabled = false;
-
-	// Do not seed games from two different host clocks.
-	EmuConfig.ManuallySetRealTimeClock = true;
-	EmuConfig.RtcYear = 0; // 2000 (PCSX2 stores year as an offset from 2000)
-	EmuConfig.RtcMonth = 1;
-	EmuConfig.RtcDay = 1;
-	EmuConfig.RtcHour = 0;
-	EmuConfig.RtcMinute = 0;
-	EmuConfig.RtcSecond = 0;
+	// Intentionally non-invasive in v0.4. v0.3 proved that enforcement based on
+	// absolute VSync/hash observations can reject a session which the v0.1 lockstep
+	// path can actually play. We collect evidence first, then reintroduce only the
+	// settings which logs show are necessary.
 }
 
 std::uint8_t HandlePadResponse(std::uint8_t unified_slot, std::uint32_t command_index, std::uint8_t local_value)
@@ -624,6 +757,15 @@ void Shutdown()
 bool IsConfigured()
 {
 	return false;
+}
+
+void StartSessionAsync()
+{
+}
+
+StatusSnapshot GetStatusSnapshot()
+{
+	return {};
 }
 
 void ApplyDeterministicConfig()
