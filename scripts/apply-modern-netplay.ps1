@@ -93,8 +93,8 @@ endif()
 }
 Write-Text $cmake $text
 
-# VMManager: re-apply a strict deterministic Netplay profile every time core settings are loaded.
-# This is the major safeguard the v0.1 proof-of-port was missing compared with classic PCSX2 Online.
+# Keep a VMManager hook available for later deterministic tuning. In v0.4 the
+# implementation is intentionally non-invasive; diagnostics are collected first.
 $text = Read-Text $vmManager
 if ($text -notmatch '#include "Netplay/ModernNetplay.h"') {
     $needle = '#include "VMManager.h"'
@@ -108,12 +108,18 @@ if ($text -notmatch 'ModernNetplay::ApplyDeterministicConfig\(\)') {
 }
 Write-Text $vmManager $text
 
-# Qt MainWindow: add a first-class Netplay menu before Help.
+# Qt MainWindow: add a first-class Netplay menu before Help and automatically
+# reopen the lobby after Create/Join restarts PCSX2.
 $text = Read-Text $mainWindow
 if ($text -notmatch '#include "NetplayDialog.h"') {
     $needle = '#include "MainWindow.h"'
     if (-not $text.Contains($needle)) { throw "MainWindow.cpp include anchor not found" }
     $text = $text.Replace($needle, "$needle`r`n#include `"NetplayDialog.h`"")
+}
+if ($text -notmatch '#include <QtCore/QTimer>') {
+    $needle = '#include "NetplayDialog.h"'
+    if (-not $text.Contains($needle)) { throw "MainWindow.cpp Netplay include anchor not found" }
+    $text = $text.Replace($needle, "$needle`r`n#include <QtCore/QTimer>")
 }
 
 if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
@@ -124,11 +130,19 @@ if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
 	// PCSX2_MODERN_NETPLAY_MENU
 	QMenu* netplay_menu = new QMenu(tr("联机 (&Netplay)"), menuBar());
 	menuBar()->insertMenu(m_ui.menuHelp->menuAction(), netplay_menu);
-	QAction* netplay_open = netplay_menu->addAction(tr("创建 / 加入房间..."));
+	QAction* netplay_open = netplay_menu->addAction(tr("创建 / 加入 / 房间状态..."));
 	connect(netplay_open, &QAction::triggered, this, [this]() {
 		NetplayDialog dialog(this);
 		dialog.exec();
 	});
+
+	if (qEnvironmentVariableIsSet("PCSX2_NETPLAY_SHOW_LOBBY"))
+	{
+		QTimer::singleShot(250, this, [this]() {
+			NetplayDialog dialog(this);
+			dialog.exec();
+		});
+	}
 '@
     $text = $text.Replace($needle, $needle + $menuCode)
 }
@@ -149,4 +163,4 @@ target_sources(pcsx2-qt PRIVATE
 }
 Write-Text $qtCmake $text
 
-Write-Host 'Modern Netplay v0.3 core + deterministic profile + Qt UI patch applied successfully.' -ForegroundColor Green
+Write-Host 'Modern Netplay v0.4 stable core + pre-game lobby + diagnostics patch applied successfully.' -ForegroundColor Green
