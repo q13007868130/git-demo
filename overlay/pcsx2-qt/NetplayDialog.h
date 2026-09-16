@@ -19,10 +19,18 @@ public:
 private:
 	void updateModeUi();
 	void updateDelayHint();
+	void refreshRuntimeStatus();
+	void openLogFolder();
+	void copyLogPath();
 	void launchConfiguredInstance();
 	void launchNormalInstance();
 
 	QLabel* m_current_status = nullptr;
+	QLabel* m_room_state = nullptr;
+	QLabel* m_player_count = nullptr;
+	QLabel* m_peer = nullptr;
+	QLabel* m_runtime_delay = nullptr;
+	QLabel* m_log_path = nullptr;
 	QComboBox* m_mode = nullptr;
 	QLineEdit* m_host = nullptr;
 	QSpinBox* m_port = nullptr;
