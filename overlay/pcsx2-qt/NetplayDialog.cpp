@@ -3,12 +3,19 @@
 
 #include "NetplayDialog.h"
 
+#include "Netplay/ModernNetplay.h"
+
 #include <QtCore/QCoreApplication>
+#include <QtCore/QDir>
+#include <QtCore/QFileInfo>
 #include <QtCore/QProcess>
 #include <QtCore/QProcessEnvironment>
 #include <QtCore/QTimer>
+#include <QtCore/QUrl>
+#include <QtGui/QClipboard>
+#include <QtGui/QDesktopServices>
+#include <QtWidgets/QApplication>
 #include <QtWidgets/QComboBox>
-#include <QtWidgets/QDialogButtonBox>
 #include <QtWidgets/QFormLayout>
 #include <QtWidgets/QGroupBox>
 #include <QtWidgets/QHBoxLayout>
@@ -22,27 +29,49 @@
 NetplayDialog::NetplayDialog(QWidget* parent)
 	: QDialog(parent)
 {
-	setWindowTitle(tr("联机 (Netplay)"));
+	setWindowTitle(tr("联机房间 (Netplay)"));
 	setModal(true);
-	setMinimumWidth(470);
+	setMinimumWidth(560);
 
 	auto* root = new QVBoxLayout(this);
 
 	m_current_status = new QLabel(this);
 	m_current_status->setWordWrap(true);
-	const QString current_mode = qEnvironmentVariable("PCSX2_NETPLAY_MODE").toLower();
-	const QString current_port = qEnvironmentVariable("PCSX2_NETPLAY_PORT", QStringLiteral("27886"));
-	const QString current_delay = qEnvironmentVariable("PCSX2_NETPLAY_DELAY", QStringLiteral("2"));
-	if (current_mode == QStringLiteral("host"))
-		m_current_status->setText(tr("当前实例：主机模式  ·  端口 %1  ·  延迟 %2 帧").arg(current_port, current_delay));
-	else if (current_mode == QStringLiteral("client") || current_mode == QStringLiteral("join"))
-		m_current_status->setText(tr("当前实例：加入模式  ·  主机 %1  ·  端口 %2  ·  延迟由主机决定")
-			.arg(qEnvironmentVariable("PCSX2_NETPLAY_HOST", QStringLiteral("?")), current_port));
-	else
-		m_current_status->setText(tr("当前实例：普通离线模式"));
 	root->addWidget(m_current_status);
 
-	auto* connection_group = new QGroupBox(tr("连接"), this);
+	// v0.4: a real session/lobby status panel. The network connection is started
+	// before the game, so host and client can confirm 1/2 -> 2/2 before booting.
+	auto* room_group = new QGroupBox(tr("房间状态"), this);
+	auto* room_form = new QFormLayout(room_group);
+	m_room_state = new QLabel(room_group);
+	m_room_state->setWordWrap(true);
+	m_player_count = new QLabel(room_group);
+	m_peer = new QLabel(room_group);
+	m_peer->setTextInteractionFlags(Qt::TextSelectableByMouse);
+	m_runtime_delay = new QLabel(room_group);
+	m_log_path = new QLabel(room_group);
+	m_log_path->setWordWrap(true);
+	m_log_path->setTextInteractionFlags(Qt::TextSelectableByMouse);
+	room_form->addRow(tr("状态："), m_room_state);
+	room_form->addRow(tr("玩家："), m_player_count);
+	room_form->addRow(tr("对方："), m_peer);
+	room_form->addRow(tr("当前延迟："), m_runtime_delay);
+	room_form->addRow(tr("本次日志："), m_log_path);
+
+	auto* log_buttons = new QHBoxLayout();
+	auto* open_log_button = new QPushButton(tr("打开日志文件夹"), room_group);
+	auto* copy_log_button = new QPushButton(tr("复制日志路径"), room_group);
+	log_buttons->addWidget(open_log_button);
+	log_buttons->addWidget(copy_log_button);
+	log_buttons->addStretch(1);
+	room_form->addRow(QString(), log_buttons);
+	root->addWidget(room_group);
+
+	const QString current_mode = qEnvironmentVariable("PCSX2_NETPLAY_MODE").toLower();
+	if (current_mode == QStringLiteral("host") || current_mode == QStringLiteral("client") || current_mode == QStringLiteral("join"))
+		ModernNetplay::StartSessionAsync();
+
+	auto* connection_group = new QGroupBox(tr("房间设置"), this);
 	auto* connection_form = new QFormLayout(connection_group);
 
 	m_mode = new QComboBox(connection_group);
@@ -78,13 +107,13 @@ NetplayDialog::NetplayDialog(QWidget* parent)
 	delay_form->addRow(QString(), m_delay_hint);
 
 	auto* explanation = new QLabel(
-		tr("延迟由主机统一决定，加入方会在握手时自动采用主机数值。距离较远或网络抖动较大时可提高帧数，以换取更稳定的同步。"), delay_group);
+		tr("延迟仍由主机统一决定。先确认房间显示 2 / 2，再在两台电脑上启动同一版本的游戏。距离较远或网络抖动较大时，可提高延迟帧数。"), delay_group);
 	explanation->setWordWrap(true);
 	delay_form->addRow(QString(), explanation);
 	root->addWidget(delay_group);
 
 	auto* note = new QLabel(
-		tr("提示：v0.2 会按这里的设置重新启动 PCSX2 联机实例。请先停在游戏列表界面再创建/加入房间；双方随后启动同一版本的游戏。"), this);
+		tr("v0.4 稳定性版已恢复 v0.1 的手柄锁步方式。v0.3 的绝对 VSync / 内存 Hash 检查改为不影响游戏的诊断思路，不会再因为启动帧偏移直接断开。每台电脑都会自动生成独立 Netplay 日志。"), this);
 	note->setWordWrap(true);
 	root->addWidget(note);
 
@@ -92,7 +121,7 @@ NetplayDialog::NetplayDialog(QWidget* parent)
 	auto* normal_button = new QPushButton(tr("重新启动为离线模式"), this);
 	m_launch = new QPushButton(tr("启动联机实例"), this);
 	m_launch->setDefault(true);
-	auto* close_button = new QPushButton(tr("关闭"), this);
+	auto* close_button = new QPushButton(tr("关闭房间窗口"), this);
 	buttons->addWidget(normal_button);
 	buttons->addStretch(1);
 	buttons->addWidget(m_launch);
@@ -104,9 +133,16 @@ NetplayDialog::NetplayDialog(QWidget* parent)
 	connect(m_launch, &QPushButton::clicked, this, [this]() { launchConfiguredInstance(); });
 	connect(normal_button, &QPushButton::clicked, this, [this]() { launchNormalInstance(); });
 	connect(close_button, &QPushButton::clicked, this, &QDialog::reject);
+	connect(open_log_button, &QPushButton::clicked, this, [this]() { openLogFolder(); });
+	connect(copy_log_button, &QPushButton::clicked, this, [this]() { copyLogPath(); });
+
+	auto* status_timer = new QTimer(this);
+	connect(status_timer, &QTimer::timeout, this, [this]() { refreshRuntimeStatus(); });
+	status_timer->start(500);
 
 	updateModeUi();
 	updateDelayHint();
+	refreshRuntimeStatus();
 }
 
 void NetplayDialog::updateModeUi()
@@ -137,6 +173,73 @@ void NetplayDialog::updateDelayHint()
 	m_delay_hint->setText(tr("当前：%1 帧。%2").arg(delay).arg(hint));
 }
 
+void NetplayDialog::refreshRuntimeStatus()
+{
+	const ModernNetplay::StatusSnapshot status = ModernNetplay::GetStatusSnapshot();
+	if (!status.configured)
+	{
+		m_current_status->setText(tr("当前实例：普通离线模式。创建或加入房间后会重启为联机实例。"));
+		m_room_state->setText(tr("未创建 / 未加入房间"));
+		m_player_count->setText(tr("0 / 2"));
+		m_peer->setText(QStringLiteral("-"));
+		m_runtime_delay->setText(QStringLiteral("-"));
+		m_log_path->setText(tr("联机实例启动后自动创建"));
+		return;
+	}
+
+	const bool is_host = (status.role == "host");
+	m_current_status->setText(is_host ?
+		tr("当前实例：房主 (P1) · TCP %1").arg(status.port) :
+		tr("当前实例：客户端 (P2) · TCP %1").arg(status.port));
+
+	if (status.failed)
+	{
+		m_room_state->setText(tr("连接错误：%1").arg(QString::fromStdString(status.last_error)));
+	}
+	else if (status.connected)
+	{
+		m_room_state->setText(tr("● 已连接。房间已满，可以关闭此窗口并在两台电脑上启动同一游戏。"));
+	}
+	else if (status.connecting)
+	{
+		m_room_state->setText(is_host ? tr("● 房间已创建，正在等待第 2 位玩家加入……") :
+			tr("● 正在连接房主……"));
+	}
+	else
+	{
+		m_room_state->setText(tr("正在准备联机会话……"));
+	}
+
+	m_player_count->setText(tr("%1 / 2").arg(status.player_count));
+	if (!status.peer.empty())
+		m_peer->setText(QString::fromStdString(status.peer));
+	else
+		m_peer->setText(is_host ? tr("等待玩家加入") : qEnvironmentVariable("PCSX2_NETPLAY_HOST", QStringLiteral("?")));
+	m_runtime_delay->setText(tr("%1 帧").arg(status.delay));
+	m_log_path->setText(status.log_path.empty() ? tr("正在创建……") : QString::fromStdString(status.log_path));
+}
+
+void NetplayDialog::openLogFolder()
+{
+	const ModernNetplay::StatusSnapshot status = ModernNetplay::GetStatusSnapshot();
+	QString folder;
+	if (!status.log_path.empty())
+		folder = QFileInfo(QString::fromStdString(status.log_path)).absolutePath();
+	else
+		folder = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("logs/netplay"));
+	QDir().mkpath(folder);
+	QDesktopServices::openUrl(QUrl::fromLocalFile(folder));
+}
+
+void NetplayDialog::copyLogPath()
+{
+	const ModernNetplay::StatusSnapshot status = ModernNetplay::GetStatusSnapshot();
+	const QString path = status.log_path.empty() ?
+		QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("logs/netplay")) :
+		QString::fromStdString(status.log_path);
+	QApplication::clipboard()->setText(path);
+}
+
 void NetplayDialog::launchConfiguredInstance()
 {
 	const QString mode = m_mode->currentData().toString();
@@ -147,7 +250,7 @@ void NetplayDialog::launchConfiguredInstance()
 	}
 
 	const auto answer = QMessageBox::question(this, tr("启动联机实例"),
-		tr("PCSX2 将以新的联机设置重新启动。\n\n请确保当前没有正在运行的游戏。是否继续？"),
+		tr("PCSX2 将以新的联机设置重新启动，并自动打开房间窗口。\n\n请确保当前没有正在运行的游戏。是否继续？"),
 		QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
 	if (answer != QMessageBox::Yes)
 		return;
@@ -155,6 +258,7 @@ void NetplayDialog::launchConfiguredInstance()
 	QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
 	env.insert(QStringLiteral("PCSX2_NETPLAY_MODE"), mode);
 	env.insert(QStringLiteral("PCSX2_NETPLAY_PORT"), QString::number(m_port->value()));
+	env.insert(QStringLiteral("PCSX2_NETPLAY_SHOW_LOBBY"), QStringLiteral("1"));
 	if (mode == QStringLiteral("host"))
 	{
 		env.remove(QStringLiteral("PCSX2_NETPLAY_HOST"));
@@ -188,6 +292,7 @@ void NetplayDialog::launchNormalInstance()
 	env.remove(QStringLiteral("PCSX2_NETPLAY_HOST"));
 	env.remove(QStringLiteral("PCSX2_NETPLAY_PORT"));
 	env.remove(QStringLiteral("PCSX2_NETPLAY_DELAY"));
+	env.remove(QStringLiteral("PCSX2_NETPLAY_SHOW_LOBBY"));
 
 	QProcess process;
 	process.setProcessEnvironment(env);
