@@ -13,9 +13,11 @@ function Write-Text([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($Path, $Text, [System.Text.UTF8Encoding]::new($false))
 }
 
-$padCpp = Join-Path $SourceRoot 'pcsx2\SIO\Pad\Pad.cpp'
-$ds2Cpp = Join-Path $SourceRoot 'pcsx2\SIO\Pad\PadDualshock2.cpp'
-$cmake  = Join-Path $SourceRoot 'pcsx2\CMakeLists.txt'
+$padCpp       = Join-Path $SourceRoot 'pcsx2\SIO\Pad\Pad.cpp'
+$ds2Cpp       = Join-Path $SourceRoot 'pcsx2\SIO\Pad\PadDualshock2.cpp'
+$cmake        = Join-Path $SourceRoot 'pcsx2\CMakeLists.txt'
+$mainWindow   = Join-Path $SourceRoot 'pcsx2-qt\MainWindow.cpp'
+$qtCmake      = Join-Path $SourceRoot 'pcsx2-qt\CMakeLists.txt'
 
 # Pad.cpp: include Netplay service, force virtual controller port 2 to DS2 while Netplay is configured,
 # and make Pad shutdown terminate the network receive thread cleanly.
@@ -72,7 +74,7 @@ if ($text -notmatch 'ModernNetplay::HandlePadResponse') {
 }
 Write-Text $ds2Cpp $text
 
-# Add the new source directly to the modern PCSX2 core target and link Winsock on Windows.
+# Add the Netplay source directly to the modern PCSX2 core target and link Winsock on Windows.
 $text = Read-Text $cmake
 if ($text -notmatch 'Netplay/ModernNetplay.cpp') {
     $addition = @'
@@ -90,4 +92,44 @@ endif()
 }
 Write-Text $cmake $text
 
-Write-Host 'Modern Netplay source patch applied successfully.' -ForegroundColor Green
+# Qt MainWindow: add a first-class Netplay menu before Help.
+$text = Read-Text $mainWindow
+if ($text -notmatch '#include "NetplayDialog.h"') {
+    $needle = '#include "MainWindow.h"'
+    if (-not $text.Contains($needle)) { throw "MainWindow.cpp include anchor not found" }
+    $text = $text.Replace($needle, "$needle`r`n#include `"NetplayDialog.h`"")
+}
+
+if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
+    $needle = "`tsetupStatusBarWidgets();"
+    if (-not $text.Contains($needle)) { throw "MainWindow.cpp setupAdditionalUi anchor not found" }
+    $menuCode = @'
+
+	// PCSX2_MODERN_NETPLAY_MENU
+	QMenu* netplay_menu = menuBar()->insertMenu(m_ui.menuHelp->menuAction(), tr("联机 (&Netplay)"));
+	QAction* netplay_open = netplay_menu->addAction(tr("创建 / 加入房间..."));
+	connect(netplay_open, &QAction::triggered, this, [this]() {
+		NetplayDialog dialog(this);
+		dialog.exec();
+	});
+'@
+    $text = $text.Replace($needle, $needle + $menuCode)
+}
+Write-Text $mainWindow $text
+
+# Qt target: compile the programmatic Netplay dialog.
+$text = Read-Text $qtCmake
+if ($text -notmatch 'NetplayDialog.cpp') {
+    $addition = @'
+
+# PCSX2 Modern Netplay Qt UI
+target_sources(pcsx2-qt PRIVATE
+    NetplayDialog.cpp
+    NetplayDialog.h
+)
+'@
+    $text += $addition
+}
+Write-Text $qtCmake $text
+
+Write-Host 'Modern Netplay core + Qt UI patch applied successfully.' -ForegroundColor Green
