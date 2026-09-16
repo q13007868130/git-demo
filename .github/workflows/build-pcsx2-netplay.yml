@@ -1,0 +1,80 @@
+name: Build PCSX2 Modern Netplay
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      POWERSHELL_TELEMETRY_OPTOUT: 1
+    steps:
+      - name: Checkout build-control repository
+        uses: actions/checkout@v4
+        with:
+          path: control
+
+      - name: Checkout current PCSX2 master
+        uses: actions/checkout@v4
+        with:
+          repository: PCSX2/pcsx2
+          ref: master
+          submodules: recursive
+          fetch-depth: 0
+          path: src
+
+      - name: Record upstream revision
+        shell: pwsh
+        working-directory: src
+        run: |
+          git rev-parse HEAD | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_SHA.txt
+          git describe --tags --always | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_VERSION.txt
+
+      - name: Build PCSX2 Windows dependencies
+        shell: cmd
+        working-directory: src
+        env:
+          DEBUG: 0
+        run: .github\workflows\scripts\windows\build-dependencies.bat
+
+      - name: Download PCSX2 patch database
+        shell: pwsh
+        working-directory: src
+        run: |
+          New-Item -ItemType Directory -Force -Path bin\resources | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/PCSX2/pcsx2_patches/releases/latest/download/patches.zip" -OutFile "bin\resources\patches.zip"
+
+      - name: Configure and build release
+        shell: cmd
+        working-directory: src
+        run: |
+          for /f "usebackq tokens=*" %%i in (`vswhere -latest -property installationPath`) do set "VSINSTPATH=%%i"
+          call "%VSINSTPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake . -B build "-DCMAKE_PREFIX_PATH=%cd%\deps" -DQT_BUILD=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DDISABLE_ADVANCE_SIMD=ON -G Ninja || exit /b 1
+          cmake --build build --config Release || exit /b 1
+          cmake --install build --config Release || exit /b 1
+
+      - name: Add build metadata
+        shell: pwsh
+        run: |
+          Copy-Item control\PCSX2_UPSTREAM_SHA.txt src\bin\PCSX2_UPSTREAM_SHA.txt -Force
+          Copy-Item control\PCSX2_UPSTREAM_VERSION.txt src\bin\PCSX2_UPSTREAM_VERSION.txt -Force
+          @"
+          This is the clean upstream-build checkpoint for the modern Netplay port.
+          Netplay implementation will be layered onto this reproducible Windows build.
+          No BIOS or game image is included.
+          "@ | Set-Content -Encoding UTF8 src\bin\NETPLAY_BUILD_INFO.txt
+
+      - name: Upload Windows x64 checkpoint
+        uses: actions/upload-artifact@v4
+        with:
+          name: PCSX2-modern-netplay-windows-x64-checkpoint
+          path: src/bin
+          if-no-files-found: error
+          retention-days: 14
