@@ -4,16 +4,37 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace ModernNetplay
 {
+	struct StatusSnapshot
+	{
+		bool configured = false;
+		bool connecting = false;
+		bool connected = false;
+		bool failed = false;
+		std::uint32_t player_count = 0;
+		std::uint32_t delay = 2;
+		std::uint16_t port = 27886;
+		std::string role;
+		std::string peer;
+		std::string last_error;
+		std::string log_path;
+	};
+
 	// True when PCSX2 was launched with PCSX2_NETPLAY_MODE=host/client.
-	// Used to make controller port 2 present without requiring a second local binding.
 	bool IsConfigured();
 
-	// Applies the conservative deterministic profile used by Netplay before VM startup.
-	// This normalizes core timing/CPU settings, disables unsafe patches/cheats and host-
-	// dependent RTC/memory-card inputs which can make two VMs drift despite identical pads.
+	// Starts the host accept/client connect path on a background thread so the
+	// Netplay dialog can behave like a real 1/2 -> 2/2 lobby before a game boots.
+	void StartSessionAsync();
+
+	// Lightweight thread-safe state used by the Qt lobby/status panel.
+	StatusSnapshot GetStatusSnapshot();
+
+	// v0.4 deliberately keeps the proven v0.1 input semantics. Determinism checks
+	// are diagnostic-only until the logs prove which settings are safe to enforce.
 	void ApplyDeterministicConfig();
 
 	// Intercepts the first six DualShock 2 POLL response bytes (two digital + four analog),
