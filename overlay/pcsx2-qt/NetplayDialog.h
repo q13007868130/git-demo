@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: 2026 PCSX2 Modern Netplay Port contributors
+// SPDX-License-Identifier: GPL-3.0+
+
+#pragma once
+
+#include <QtWidgets/QDialog>
+
+class QComboBox;
+class QLabel;
+class QLineEdit;
+class QPushButton;
+class QSpinBox;
+
+class NetplayDialog final : public QDialog
+{
+public:
+	explicit NetplayDialog(QWidget* parent = nullptr);
+
+private:
+	void updateModeUi();
+	void updateDelayHint();
+	void launchConfiguredInstance();
+	void launchNormalInstance();
+
+	QLabel* m_current_status = nullptr;
+	QComboBox* m_mode = nullptr;
+	QLineEdit* m_host = nullptr;
+	QSpinBox* m_port = nullptr;
+	QSpinBox* m_delay = nullptr;
+	QLabel* m_delay_hint = nullptr;
+	QPushButton* m_launch = nullptr;
+};
