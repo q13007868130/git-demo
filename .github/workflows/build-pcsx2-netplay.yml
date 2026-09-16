@@ -36,6 +36,16 @@ jobs:
           git rev-parse HEAD | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_SHA.txt
           git describe --tags --always | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_VERSION.txt
 
+      - name: Apply Modern Netplay port
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path src\pcsx2\Netplay | Out-Null
+          Copy-Item control\overlay\pcsx2\Netplay\ModernNetplay.h src\pcsx2\Netplay\ModernNetplay.h -Force
+          Copy-Item control\overlay\pcsx2\Netplay\ModernNetplay.cpp src\pcsx2\Netplay\ModernNetplay.cpp -Force
+          & control\scripts\apply-modern-netplay.ps1 -SourceRoot (Resolve-Path src)
+          git -C src diff --check
+          git -C src diff -- pcsx2/SIO/Pad/Pad.cpp pcsx2/SIO/Pad/PadDualshock2.cpp pcsx2/CMakeLists.txt
+
       - name: Build PCSX2 Windows dependencies
         shell: cmd
         working-directory: src
@@ -60,21 +70,71 @@ jobs:
           cmake --build build --config Release || exit /b 1
           cmake --install build --config Release || exit /b 1
 
-      - name: Add build metadata
+      - name: Package Netplay launchers and metadata
         shell: pwsh
         run: |
           Copy-Item control\PCSX2_UPSTREAM_SHA.txt src\bin\PCSX2_UPSTREAM_SHA.txt -Force
           Copy-Item control\PCSX2_UPSTREAM_VERSION.txt src\bin\PCSX2_UPSTREAM_VERSION.txt -Force
           @"
-          This is the clean upstream-build checkpoint for the modern Netplay port.
-          Netplay implementation will be layered onto this reproducible Windows build.
-          No BIOS or game image is included.
+          PCSX2 Modern Netplay v0.1
+          =========================
+          Base: current PCSX2 master at build time (exact SHA in PCSX2_UPSTREAM_SHA.txt)
+          Netplay model: two-player delay-based lockstep at the DS2 SIO/PAD response boundary
+          Synced input: 2 digital bytes + 4 analog bytes, matching the classic PCSX2 Online design
+          Transport: reliable TCP proof-of-port implementation
+          Default port: 27886/TCP
+          Default input delay: 2 pad-poll frames
+
+          Requirements for this first test build:
+          - Both players use the same game image/region and compatible BIOS/settings.
+          - Start the host with Netplay-Host.bat and the second player with Netplay-Join.bat.
+          - Windows Firewall/NAT must allow TCP 27886 to reach the host.
+          - Controller port 2 is made present automatically while Netplay mode is enabled.
+          - No BIOS or game image is included.
+
+          v0.1 intentionally does not yet provide rollback, matchmaking/relay, save-state resync,
+          pressure-byte synchronization, or a Qt room browser. Those come after the transport/input
+          port is proven on real games such as Tekken 5.
           "@ | Set-Content -Encoding UTF8 src\bin\NETPLAY_BUILD_INFO.txt
 
-      - name: Upload Windows x64 checkpoint
+          @'
+          @echo off
+          setlocal
+          set "PCSX2_NETPLAY_MODE=host"
+          set "PCSX2_NETPLAY_PORT=27886"
+          set "PCSX2_NETPLAY_DELAY=2"
+          echo ============================================================
+          echo PCSX2 Modern Netplay v0.1 - HOST
+          echo TCP port: %PCSX2_NETPLAY_PORT%   Input delay: %PCSX2_NETPLAY_DELAY%
+          echo Start the same game on both computers. The emulator may pause
+          echo at the first controller poll until the joining player connects.
+          echo ============================================================
+          start "" "%~dp0pcsx2-qt.exe"
+          endlocal
+          '@ | Set-Content -Encoding ASCII src\bin\Netplay-Host.bat
+
+          @'
+          @echo off
+          setlocal
+          set /p "NETPLAY_HOST=Host IPv4 or hostname: "
+          if "%NETPLAY_HOST%"=="" exit /b 1
+          set "PCSX2_NETPLAY_MODE=client"
+          set "PCSX2_NETPLAY_HOST=%NETPLAY_HOST%"
+          set "PCSX2_NETPLAY_PORT=27886"
+          set "PCSX2_NETPLAY_DELAY=2"
+          echo ============================================================
+          echo PCSX2 Modern Netplay v0.1 - JOIN
+          echo Host: %PCSX2_NETPLAY_HOST%:%PCSX2_NETPLAY_PORT%
+          echo The host controls the final input-delay value.
+          echo ============================================================
+          start "" "%~dp0pcsx2-qt.exe"
+          endlocal
+          '@ | Set-Content -Encoding ASCII src\bin\Netplay-Join.bat
+
+      - name: Upload Windows x64 Netplay build
         uses: actions/upload-artifact@v4
         with:
-          name: PCSX2-modern-netplay-windows-x64-checkpoint
+          name: PCSX2-modern-netplay-windows-x64-v0.1
           path: src/bin
           if-no-files-found: error
           retention-days: 14
