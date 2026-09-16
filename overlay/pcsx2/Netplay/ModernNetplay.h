@@ -4,13 +4,17 @@
 #pragma once
 
 #include <cstdint>
-#include <iterator>
 
 namespace ModernNetplay
 {
 	// True when PCSX2 was launched with PCSX2_NETPLAY_MODE=host/client.
 	// Used to make controller port 2 present without requiring a second local binding.
 	bool IsConfigured();
+
+	// Applies the conservative deterministic profile used by Netplay before VM startup.
+	// This normalizes core timing/CPU settings, disables unsafe patches/cheats and host-
+	// dependent RTC/memory-card inputs which can make two VMs drift despite identical pads.
+	void ApplyDeterministicConfig();
 
 	// Intercepts the first six DualShock 2 POLL response bytes (two digital + four analog),
 	// matching the synchronization boundary used by the old PCSX2 Online/1.5-era netplay code.

@@ -38,7 +38,7 @@ jobs:
           git rev-parse HEAD | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_SHA.txt
           git describe --tags --always | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_VERSION.txt
 
-      - name: Apply Modern Netplay port and Qt UI
+      - name: Apply Modern Netplay v0.3 port and Qt UI
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path src\pcsx2\Netplay | Out-Null
@@ -48,11 +48,11 @@ jobs:
           Copy-Item control\overlay\pcsx2-qt\NetplayDialog.cpp src\pcsx2-qt\NetplayDialog.cpp -Force
           & control\scripts\apply-modern-netplay.ps1 -SourceRoot (Resolve-Path src)
           git -C src diff --check
-          git -C src diff -- pcsx2/SIO/Pad/Pad.cpp pcsx2/SIO/Pad/PadDualshock2.cpp pcsx2/CMakeLists.txt pcsx2-qt/MainWindow.cpp pcsx2-qt/CMakeLists.txt
+          git -C src diff -- pcsx2/SIO/Pad/Pad.cpp pcsx2/SIO/Pad/PadDualshock2.cpp pcsx2/VMManager.cpp pcsx2/CMakeLists.txt pcsx2-qt/MainWindow.cpp pcsx2-qt/CMakeLists.txt
 
-      - name: Cache PCSX2 Windows dependencies
+      - name: Restore PCSX2 Windows dependencies
         id: cache-deps
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: src/deps
           key: pcsx2-windows-2025-deps-${{ hashFiles('src/.github/workflows/scripts/windows/build-dependencies.bat', 'src/.github/workflows/scripts/common/*.patch') }}
@@ -64,6 +64,13 @@ jobs:
         env:
           DEBUG: 0
         run: .github\workflows\scripts\windows\build-dependencies.bat
+
+      - name: Save PCSX2 Windows dependencies immediately
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: src/deps
+          key: pcsx2-windows-2025-deps-${{ hashFiles('src/.github/workflows/scripts/windows/build-dependencies.bat', 'src/.github/workflows/scripts/common/*.patch') }}
 
       - name: Download PCSX2 patch database
         shell: pwsh
@@ -88,23 +95,29 @@ jobs:
           Copy-Item control\PCSX2_UPSTREAM_SHA.txt src\bin\PCSX2_UPSTREAM_SHA.txt -Force
           Copy-Item control\PCSX2_UPSTREAM_VERSION.txt src\bin\PCSX2_UPSTREAM_VERSION.txt -Force
           @"
-          PCSX2 Modern Netplay v0.2
-          =========================
+          PCSX2 Modern Netplay v0.3 synchronization build
+          =================================================
           Base: current PCSX2 master at build time (exact SHA in PCSX2_UPSTREAM_SHA.txt)
-          Netplay model: two-player delay-based lockstep at the DS2 SIO/PAD response boundary
-          Synced input: 2 digital bytes + 4 analog bytes, matching the classic PCSX2 Online design
-          Transport: reliable TCP proof-of-port implementation
+          Protocol: v2
+          Transport: reliable TCP
           Default port: 27886/TCP
           Input delay: host selectable from 1 to 12 frames in the built-in Netplay UI
 
-          New in v0.2:
-          - Built-in 联机 (Netplay) menu in the PCSX2 Qt menu bar.
-          - Create/Join dialog with host address, port, and input-delay controls.
-          - Host is authoritative for delay; the joining peer follows the host during handshake.
-          - Delay guidance for LAN, medium-distance, and high-latency connections.
-          - UI restarts PCSX2 with the selected Netplay environment before PAD initialization,
-            preserving the already-proven v0.1 synchronization path.
-          - Dependency caching in CI so later Netplay iterations should build much faster.
+          Synchronization changes in v0.3:
+          - Strict deterministic Netplay profile applied whenever core settings load.
+          - CPU settings reset to common defaults and speedhacks disabled.
+          - Cheats, user patches, widescreen/no-interlace patches and HostFS disabled.
+          - Host-refresh timing disabled; nominal speed forced to 100 percent.
+          - Synchronous MTGS enabled for conservative cross-machine behavior.
+          - Virtual PS2 RTC fixed to 2000-01-01 00:00:00 on both peers.
+          - Memory cards temporarily disabled until host-to-client card sync is ported.
+          - Every controller sample carries the canonical PCSX2 VSync frame (g_FrameCount).
+          - EE+IOP RAM is hashed periodically and compared between peers.
+          - Netplay now stops and reports the first timeline/state mismatch instead of silently drifting.
+
+          UI changes:
+          - Built-in 联机 (Netplay) menu with Create/Join and delay selection.
+          - Fixed Qt QMenu construction from the failed v0.2 build.
 
           Netplay-Host.bat and Netplay-Join.bat remain included as fallback launchers.
           No BIOS or game image is included.
@@ -117,7 +130,7 @@ jobs:
           set "PCSX2_NETPLAY_PORT=27886"
           set "PCSX2_NETPLAY_DELAY=2"
           echo ============================================================
-          echo PCSX2 Modern Netplay v0.2 - HOST fallback launcher
+          echo PCSX2 Modern Netplay v0.3 - HOST fallback launcher
           echo TCP port: %PCSX2_NETPLAY_PORT%   Input delay: %PCSX2_NETPLAY_DELAY%
           echo The built-in Netplay menu is recommended for normal use.
           echo ============================================================
@@ -135,7 +148,7 @@ jobs:
           set "PCSX2_NETPLAY_PORT=27886"
           set "PCSX2_NETPLAY_DELAY=2"
           echo ============================================================
-          echo PCSX2 Modern Netplay v0.2 - JOIN fallback launcher
+          echo PCSX2 Modern Netplay v0.3 - JOIN fallback launcher
           echo Host: %PCSX2_NETPLAY_HOST%:%PCSX2_NETPLAY_PORT%
           echo The host controls the final input-delay value.
           echo ============================================================
@@ -146,7 +159,7 @@ jobs:
       - name: Upload Windows x64 Netplay build
         uses: actions/upload-artifact@v4
         with:
-          name: PCSX2-modern-netplay-windows-x64-v0.2
+          name: PCSX2-modern-netplay-windows-x64-v0.3-sync
           path: src/bin
           if-no-files-found: error
           retention-days: 14

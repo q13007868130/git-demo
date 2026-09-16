@@ -3,6 +3,12 @@
 
 #include "Netplay/ModernNetplay.h"
 
+#include "Config.h"
+#include "Counters.h"
+#include "GS/GSXXH.h"
+#include "IopMem.h"
+#include "Memory.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -29,10 +35,18 @@ namespace
 	using InputFrame = std::array<std::uint8_t, 6>;
 	constexpr std::uint32_t HELLO_MAGIC = 0x50324E50; // P2NP
 	constexpr std::uint32_t FRAME_MAGIC = 0x46524D45; // FRME
-	constexpr std::uint32_t PROTOCOL_VERSION = 1;
+	constexpr std::uint32_t PROTOCOL_VERSION = 2;
 	constexpr std::uint16_t DEFAULT_PORT = 27886;
 	constexpr int RECEIVE_TIMEOUT_SECONDS = 10;
+	constexpr std::uint32_t STATE_HASH_INTERVAL = 120;
 	constexpr InputFrame NEUTRAL_FRAME = {0xff, 0xff, 0x7f, 0x7f, 0x7f, 0x7f};
+
+	struct InputSample
+	{
+		InputFrame input = NEUTRAL_FRAME;
+		std::uint32_t emu_frame = 0;
+		std::uint64_t state_hash = 0;
+	};
 
 	enum class Role : std::uint32_t
 	{
@@ -52,6 +66,25 @@ namespace
 		std::uint32_t value;
 		std::memcpy(&value, src, sizeof(value));
 		return ntohl(value);
+	}
+
+	void WriteU64(std::uint8_t* dst, std::uint64_t value)
+	{
+		WriteU32(dst, static_cast<std::uint32_t>(value >> 32));
+		WriteU32(dst + 4, static_cast<std::uint32_t>(value));
+	}
+
+	std::uint64_t ReadU64(const std::uint8_t* src)
+	{
+		return (static_cast<std::uint64_t>(ReadU32(src)) << 32) |
+			static_cast<std::uint64_t>(ReadU32(src + 4));
+	}
+
+	std::uint64_t HashVmMemory()
+	{
+		const std::uint64_t ee_hash = GSXXH3_64bits(eeMem->Main, Ps2MemSize::ExposedRam);
+		const std::uint64_t iop_hash = GSXXH3_64bits(iopMem->Main, Ps2MemSize::ExposedIopRam);
+		return ee_hash ^ (iop_hash + 0x9e3779b97f4a7c15ULL + (ee_hash << 6) + (ee_hash >> 2));
 	}
 
 	bool SendAll(SOCKET socket, const void* data, std::size_t size)
@@ -121,7 +154,7 @@ namespace
 
 			if (unified_slot == 0)
 			{
-				m_capture[input_index] = local_value;
+				m_capture.input[input_index] = local_value;
 				return (m_role == Role::Host) ? m_local_output[input_index] : m_remote_output[input_index];
 			}
 
@@ -187,9 +220,9 @@ namespace
 			if (const char* delay = std::getenv("PCSX2_NETPLAY_DELAY"))
 				m_delay = static_cast<std::uint32_t>(std::clamp(std::atoi(delay), 1, 12));
 
-			std::fprintf(stderr, "[ModernNetplay] configured: mode=%s port=%u delay=%u host=%s\n",
+			std::fprintf(stderr, "[ModernNetplay] configured: mode=%s port=%u delay=%u host=%s protocol=%u\n",
 				(m_role == Role::Host) ? "host" : "client", static_cast<unsigned>(m_port),
-				static_cast<unsigned>(m_delay), m_host.c_str());
+				static_cast<unsigned>(m_delay), m_host.c_str(), static_cast<unsigned>(PROTOCOL_VERSION));
 		}
 
 		bool BeginPadPoll()
@@ -197,44 +230,78 @@ namespace
 			if (!EnsureConnected())
 				return false;
 
-			// The old PCSX2 Online shim committed one pad sample when the next pad poll
-			// began. Doing the same here avoids needing to know whether a game requested
-			// digital, analog, or pressure-sensitive response lengths.
+			// Commit the pad sample captured by the preceding poll. In protocol v2 each
+			// sample also carries PCSX2's canonical VSync frame number and a periodic
+			// VM-memory hash. This lets us stop on the first real divergence instead of
+			// silently pairing unrelated pad polls for minutes.
 			if (m_have_capture)
 			{
-				m_local_frames[m_frame] = m_capture;
-				if (!SendFrame(m_frame, m_capture))
+				m_local_frames[m_poll_frame] = m_capture;
+				if (!SendFrame(m_poll_frame, m_capture))
 				{
 					Fail("failed to send controller frame");
 					return false;
 				}
-				++m_frame;
+				++m_poll_frame;
 			}
 			else
 			{
 				m_have_capture = true;
 			}
 
-			m_capture = NEUTRAL_FRAME;
+			m_capture.input = NEUTRAL_FRAME;
+			m_capture.emu_frame = static_cast<std::uint32_t>(g_FrameCount);
+			m_capture.state_hash = 0;
+			if (m_capture.emu_frame >= m_next_hash_emu_frame)
+			{
+				m_capture.state_hash = HashVmMemory();
+				m_next_hash_emu_frame = m_capture.emu_frame + STATE_HASH_INTERVAL;
+			}
+
 			m_local_output = NEUTRAL_FRAME;
 			m_remote_output = NEUTRAL_FRAME;
 
-			if (m_frame >= m_delay)
+			if (m_poll_frame >= m_delay)
 			{
-				const std::uint32_t source_frame = m_frame - m_delay;
+				const std::uint32_t source_frame = m_poll_frame - m_delay;
 				const auto local = m_local_frames.find(source_frame);
 				if (local == m_local_frames.end())
 				{
 					Fail("local delayed frame is missing");
 					return false;
 				}
-				m_local_output = local->second;
 
-				if (!WaitForRemoteFrame(source_frame, &m_remote_output))
+				InputSample remote;
+				if (!WaitForRemoteFrame(source_frame, &remote))
 				{
 					Fail("timed out waiting for peer controller frame");
 					return false;
 				}
+
+				if (local->second.emu_frame != remote.emu_frame)
+				{
+					std::fprintf(stderr,
+						"[ModernNetplay] DESYNC: input timeline mismatch at poll=%u local-vsync=%u peer-vsync=%u\n",
+						static_cast<unsigned>(source_frame), static_cast<unsigned>(local->second.emu_frame),
+						static_cast<unsigned>(remote.emu_frame));
+					Fail("emulation frame timeline diverged");
+					return false;
+				}
+
+				if (local->second.state_hash != remote.state_hash &&
+					(local->second.state_hash != 0 || remote.state_hash != 0))
+				{
+					std::fprintf(stderr,
+						"[ModernNetplay] DESYNC: VM state mismatch at poll=%u vsync=%u local=%016llx peer=%016llx\n",
+						static_cast<unsigned>(source_frame), static_cast<unsigned>(local->second.emu_frame),
+						static_cast<unsigned long long>(local->second.state_hash),
+						static_cast<unsigned long long>(remote.state_hash));
+					Fail("virtual machine state hash diverged");
+					return false;
+				}
+
+				m_local_output = local->second.input;
+				m_remote_output = remote.input;
 			}
 
 			PruneFrames();
@@ -380,12 +447,14 @@ namespace
 				ReadU32(hello.data() + 8) == static_cast<std::uint32_t>(expected_role);
 		}
 
-		bool SendFrame(std::uint32_t frame, const InputFrame& input)
+		bool SendFrame(std::uint32_t frame, const InputSample& sample)
 		{
-			std::array<std::uint8_t, 14> packet{};
+			std::array<std::uint8_t, 26> packet{};
 			WriteU32(packet.data() + 0, FRAME_MAGIC);
 			WriteU32(packet.data() + 4, frame);
-			std::memcpy(packet.data() + 8, input.data(), input.size());
+			WriteU32(packet.data() + 8, sample.emu_frame);
+			WriteU64(packet.data() + 12, sample.state_hash);
+			std::memcpy(packet.data() + 20, sample.input.data(), sample.input.size());
 
 			std::lock_guard<std::mutex> lock(m_socket_mutex);
 			return m_socket != INVALID_SOCKET && SendAll(m_socket, packet.data(), packet.size());
@@ -395,7 +464,7 @@ namespace
 		{
 			while (m_running.load(std::memory_order_acquire))
 			{
-				std::array<std::uint8_t, 14> packet{};
+				std::array<std::uint8_t, 26> packet{};
 				SOCKET socket;
 				{
 					std::lock_guard<std::mutex> lock(m_socket_mutex);
@@ -407,11 +476,13 @@ namespace
 				if (ReadU32(packet.data() + 0) != FRAME_MAGIC)
 					break;
 
-				InputFrame input{};
-				std::memcpy(input.data(), packet.data() + 8, input.size());
+				InputSample sample;
+				sample.emu_frame = ReadU32(packet.data() + 8);
+				sample.state_hash = ReadU64(packet.data() + 12);
+				std::memcpy(sample.input.data(), packet.data() + 20, sample.input.size());
 				{
 					std::lock_guard<std::mutex> lock(m_remote_mutex);
-					m_remote_frames[ReadU32(packet.data() + 4)] = input;
+					m_remote_frames[ReadU32(packet.data() + 4)] = sample;
 				}
 				m_remote_cv.notify_all();
 			}
@@ -422,7 +493,7 @@ namespace
 			std::fprintf(stderr, "[ModernNetplay] peer disconnected\n");
 		}
 
-		bool WaitForRemoteFrame(std::uint32_t frame, InputFrame* output)
+		bool WaitForRemoteFrame(std::uint32_t frame, InputSample* output)
 		{
 			std::unique_lock<std::mutex> lock(m_remote_mutex);
 			const bool ready = m_remote_cv.wait_for(lock, std::chrono::seconds(RECEIVE_TIMEOUT_SECONDS), [this, frame]() {
@@ -441,9 +512,9 @@ namespace
 
 		void PruneFrames()
 		{
-			if (m_frame < 180)
+			if (m_poll_frame < 180)
 				return;
-			const std::uint32_t keep_from = m_frame - 120;
+			const std::uint32_t keep_from = m_poll_frame - 120;
 			for (auto it = m_local_frames.begin(); it != m_local_frames.end();)
 				it = (it->first < keep_from) ? m_local_frames.erase(it) : std::next(it);
 			std::lock_guard<std::mutex> lock(m_remote_mutex);
@@ -464,14 +535,15 @@ namespace
 		std::string m_host = "127.0.0.1";
 		std::uint16_t m_port = DEFAULT_PORT;
 		std::uint32_t m_delay = 2;
-		std::uint32_t m_frame = 0;
+		std::uint32_t m_poll_frame = 0;
+		std::uint32_t m_next_hash_emu_frame = STATE_HASH_INTERVAL;
 		bool m_have_capture = false;
 		bool m_winsock_started = false;
-		InputFrame m_capture = NEUTRAL_FRAME;
+		InputSample m_capture{};
 		InputFrame m_local_output = NEUTRAL_FRAME;
 		InputFrame m_remote_output = NEUTRAL_FRAME;
-		std::unordered_map<std::uint32_t, InputFrame> m_local_frames;
-		std::unordered_map<std::uint32_t, InputFrame> m_remote_frames;
+		std::unordered_map<std::uint32_t, InputSample> m_local_frames;
+		std::unordered_map<std::uint32_t, InputSample> m_remote_frames;
 		SOCKET m_socket = INVALID_SOCKET;
 		std::atomic<bool> m_connected{false};
 		std::atomic<bool> m_running{false};
@@ -495,6 +567,50 @@ bool IsConfigured()
 	return GetSession().IsConfigured();
 }
 
+void ApplyDeterministicConfig()
+{
+	if (!GetSession().IsConfigured())
+		return;
+
+	// Classic PCSX2 Online did considerably more than exchange pad bytes: it forced
+	// both emulators onto a conservative deterministic profile. v0.1 omitted that,
+	// which allowed two otherwise-connected VMs to drift after several minutes.
+	EmuConfig.HostFs = false;
+	EmuConfig.EnablePatches = false;
+	EmuConfig.EnableCheats = false;
+	EmuConfig.EnableWideScreenPatches = false;
+	EmuConfig.EnableNoInterlacingPatches = false;
+	EmuConfig.CdvdVerboseReads = false;
+	EmuConfig.CdvdDumpBlocks = false;
+	EmuConfig.EnableGameFixes = true;
+	EmuConfig.Pad.MultitapPort0_Enabled = false;
+	EmuConfig.Pad.MultitapPort1_Enabled = false;
+	EmuConfig.Speedhacks.DisableAll();
+	EmuConfig.Cpu = Pcsx2Config::CpuOptions();
+	EmuConfig.Profiler = Pcsx2Config::ProfilerOptions();
+	EmuConfig.Trace.Enabled = false;
+	EmuConfig.EmulationSpeed.SyncToHostRefreshRate = false;
+	EmuConfig.EmulationSpeed.UseVSyncForTiming = false;
+	EmuConfig.EmulationSpeed.NominalScalar = 1.0f;
+	EmuConfig.GS.SynchronousMTGS = true;
+	EmuConfig.GS.SkipDuplicateFrames = false;
+
+	// Until host-to-client memory-card synchronization is ported, disable all cards
+	// during Netplay. Different card contents can alter unlocks, settings and RNG state
+	// before the first synchronized controller sample.
+	for (Pcsx2Config::McdOptions& card : EmuConfig.Mcd)
+		card.Enabled = false;
+
+	// Do not seed games from two different host clocks.
+	EmuConfig.ManuallySetRealTimeClock = true;
+	EmuConfig.RtcYear = 0; // 2000 (PCSX2 stores year as an offset from 2000)
+	EmuConfig.RtcMonth = 1;
+	EmuConfig.RtcDay = 1;
+	EmuConfig.RtcHour = 0;
+	EmuConfig.RtcMinute = 0;
+	EmuConfig.RtcSecond = 0;
+}
+
 std::uint8_t HandlePadResponse(std::uint8_t unified_slot, std::uint32_t command_index, std::uint8_t local_value)
 {
 	return GetSession().HandlePadResponse(unified_slot, command_index, local_value);
@@ -508,6 +624,10 @@ void Shutdown()
 bool IsConfigured()
 {
 	return false;
+}
+
+void ApplyDeterministicConfig()
+{
 }
 
 std::uint8_t HandlePadResponse(std::uint8_t, std::uint32_t, std::uint8_t local_value)

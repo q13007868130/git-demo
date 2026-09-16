@@ -16,6 +16,7 @@ function Write-Text([string]$Path, [string]$Text) {
 $padCpp       = Join-Path $SourceRoot 'pcsx2\SIO\Pad\Pad.cpp'
 $ds2Cpp       = Join-Path $SourceRoot 'pcsx2\SIO\Pad\PadDualshock2.cpp'
 $cmake        = Join-Path $SourceRoot 'pcsx2\CMakeLists.txt'
+$vmManager    = Join-Path $SourceRoot 'pcsx2\VMManager.cpp'
 $mainWindow   = Join-Path $SourceRoot 'pcsx2-qt\MainWindow.cpp'
 $qtCmake      = Join-Path $SourceRoot 'pcsx2-qt\CMakeLists.txt'
 
@@ -92,6 +93,21 @@ endif()
 }
 Write-Text $cmake $text
 
+# VMManager: re-apply a strict deterministic Netplay profile every time core settings are loaded.
+# This is the major safeguard the v0.1 proof-of-port was missing compared with classic PCSX2 Online.
+$text = Read-Text $vmManager
+if ($text -notmatch '#include "Netplay/ModernNetplay.h"') {
+    $needle = '#include "VMManager.h"'
+    if (-not $text.Contains($needle)) { throw "VMManager.cpp include anchor not found" }
+    $text = $text.Replace($needle, "$needle`r`n#include `"Netplay/ModernNetplay.h`"")
+}
+if ($text -notmatch 'ModernNetplay::ApplyDeterministicConfig\(\)') {
+    $needle = "`tPatch::ApplyPatchSettingOverrides();"
+    if (-not $text.Contains($needle)) { throw "VMManager.cpp LoadCoreSettings anchor not found" }
+    $text = $text.Replace($needle, "$needle`r`n`tModernNetplay::ApplyDeterministicConfig();")
+}
+Write-Text $vmManager $text
+
 # Qt MainWindow: add a first-class Netplay menu before Help.
 $text = Read-Text $mainWindow
 if ($text -notmatch '#include "NetplayDialog.h"') {
@@ -106,7 +122,8 @@ if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
     $menuCode = @'
 
 	// PCSX2_MODERN_NETPLAY_MENU
-	QMenu* netplay_menu = menuBar()->insertMenu(m_ui.menuHelp->menuAction(), tr("联机 (&Netplay)"));
+	QMenu* netplay_menu = new QMenu(tr("联机 (&Netplay)"), menuBar());
+	menuBar()->insertMenu(m_ui.menuHelp->menuAction(), netplay_menu);
 	QAction* netplay_open = netplay_menu->addAction(tr("创建 / 加入房间..."));
 	connect(netplay_open, &QAction::triggered, this, [this]() {
 		NetplayDialog dialog(this);
@@ -132,4 +149,4 @@ target_sources(pcsx2-qt PRIVATE
 }
 Write-Text $qtCmake $text
 
-Write-Host 'Modern Netplay core + Qt UI patch applied successfully.' -ForegroundColor Green
+Write-Host 'Modern Netplay v0.3 core + deterministic profile + Qt UI patch applied successfully.' -ForegroundColor Green
