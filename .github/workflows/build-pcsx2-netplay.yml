@@ -38,7 +38,7 @@ jobs:
           git rev-parse HEAD | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_SHA.txt
           git describe --tags --always | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_VERSION.txt
 
-      - name: Apply Modern Netplay v0.3 port and Qt UI
+      - name: Apply Modern Netplay v0.4 stable core, lobby and diagnostics
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path src\pcsx2\Netplay | Out-Null
@@ -89,35 +89,40 @@ jobs:
           cmake --build build --config Release || exit /b 1
           cmake --install build --config Release || exit /b 1
 
-      - name: Package Netplay launchers and metadata
+      - name: Package Netplay launchers, diagnostics and metadata
         shell: pwsh
         run: |
           Copy-Item control\PCSX2_UPSTREAM_SHA.txt src\bin\PCSX2_UPSTREAM_SHA.txt -Force
           Copy-Item control\PCSX2_UPSTREAM_VERSION.txt src\bin\PCSX2_UPSTREAM_VERSION.txt -Force
+          Copy-Item control\scripts\Collect-Netplay-Diagnostics.ps1 src\bin\Collect-Netplay-Diagnostics.ps1 -Force
+          Copy-Item control\scripts\Collect-Netplay-Diagnostics.bat src\bin\Collect-Netplay-Diagnostics.bat -Force
           @"
-          PCSX2 Modern Netplay v0.3 synchronization build
+          PCSX2 Modern Netplay v0.4 stability/lobby build
           =================================================
           Base: current PCSX2 master at build time (exact SHA in PCSX2_UPSTREAM_SHA.txt)
-          Protocol: v2
+          Protocol: v1-compatible controller transport (restored from the working v0.1 path)
           Transport: reliable TCP
           Default port: 27886/TCP
           Input delay: host selectable from 1 to 12 frames in the built-in Netplay UI
 
-          Synchronization changes in v0.3:
-          - Strict deterministic Netplay profile applied whenever core settings load.
-          - CPU settings reset to common defaults and speedhacks disabled.
-          - Cheats, user patches, widescreen/no-interlace patches and HostFS disabled.
-          - Host-refresh timing disabled; nominal speed forced to 100 percent.
-          - Synchronous MTGS enabled for conservative cross-machine behavior.
-          - Virtual PS2 RTC fixed to 2000-01-01 00:00:00 on both peers.
-          - Memory cards temporarily disabled until host-to-client card sync is ported.
-          - Every controller sample carries the canonical PCSX2 VSync frame (g_FrameCount).
-          - EE+IOP RAM is hashed periodically and compared between peers.
-          - Netplay now stops and reports the first timeline/state mismatch instead of silently drifting.
+          Fixes after v0.3 field testing:
+          - Restores the v0.1 controller lockstep and 14-byte input packet semantics.
+          - Removes fatal absolute VSync and VM-memory-hash comparisons which could reject
+            two playable peers merely because they booted with a constant frame offset.
+          - Keeps synchronization diagnostics in local log files instead of disconnecting.
+          - Starts Host/Join networking before game boot so the room can show 1/2 -> 2/2.
+          - Adds a dedicated room/status panel with peer, player count, active delay and log path.
+          - Create/Join restarts automatically reopen the room window.
+          - Creates logs under logs\netplay on both computers.
+          - Includes Collect-Netplay-Diagnostics.bat to package logs + build revision for bug reports.
 
-          UI changes:
-          - Built-in 联机 (Netplay) menu with Create/Join and delay selection.
-          - Fixed Qt QMenu construction from the failed v0.2 build.
+          Test procedure:
+          1. Host: 联机 -> 创建房间, select delay, restart.
+          2. Client: 联机 -> 加入房间, enter Host IP, restart.
+          3. Wait until BOTH room windows show 2 / 2.
+          4. Close the room windows and start the exact same game/version on both PCs.
+          5. If anything diverges or disconnects, run Collect-Netplay-Diagnostics.bat on BOTH PCs
+             and keep both generated ZIP files.
 
           Netplay-Host.bat and Netplay-Join.bat remain included as fallback launchers.
           No BIOS or game image is included.
@@ -129,10 +134,11 @@ jobs:
           set "PCSX2_NETPLAY_MODE=host"
           set "PCSX2_NETPLAY_PORT=27886"
           set "PCSX2_NETPLAY_DELAY=2"
+          set "PCSX2_NETPLAY_SHOW_LOBBY=1"
           echo ============================================================
-          echo PCSX2 Modern Netplay v0.3 - HOST fallback launcher
+          echo PCSX2 Modern Netplay v0.4 - HOST fallback launcher
           echo TCP port: %PCSX2_NETPLAY_PORT%   Input delay: %PCSX2_NETPLAY_DELAY%
-          echo The built-in Netplay menu is recommended for normal use.
+          echo Wait for room status 2/2 before starting the game.
           echo ============================================================
           start "" "%~dp0pcsx2-qt.exe"
           endlocal
@@ -147,10 +153,11 @@ jobs:
           set "PCSX2_NETPLAY_HOST=%NETPLAY_HOST%"
           set "PCSX2_NETPLAY_PORT=27886"
           set "PCSX2_NETPLAY_DELAY=2"
+          set "PCSX2_NETPLAY_SHOW_LOBBY=1"
           echo ============================================================
-          echo PCSX2 Modern Netplay v0.3 - JOIN fallback launcher
+          echo PCSX2 Modern Netplay v0.4 - JOIN fallback launcher
           echo Host: %PCSX2_NETPLAY_HOST%:%PCSX2_NETPLAY_PORT%
-          echo The host controls the final input-delay value.
+          echo Wait for room status 2/2 before starting the game.
           echo ============================================================
           start "" "%~dp0pcsx2-qt.exe"
           endlocal
@@ -159,7 +166,7 @@ jobs:
       - name: Upload Windows x64 Netplay build
         uses: actions/upload-artifact@v4
         with:
-          name: PCSX2-modern-netplay-windows-x64-v0.3-sync
+          name: PCSX2-modern-netplay-windows-x64-v0.4-stability-lobby
           path: src/bin
           if-no-files-found: error
           retention-days: 14
