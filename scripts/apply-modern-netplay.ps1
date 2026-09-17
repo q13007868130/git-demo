@@ -13,11 +13,24 @@ function Write-Text([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($Path, $Text, [System.Text.UTF8Encoding]::new($false))
 }
 
+function Replace-Portable([string]$Text, [string]$OldLf, [string]$NewLf, [string]$ErrorMessage) {
+    if ($Text.Contains($OldLf)) {
+        return $Text.Replace($OldLf, $NewLf)
+    }
+    $oldCrlf = $OldLf.Replace("`n", "`r`n")
+    $newCrlf = $NewLf.Replace("`n", "`r`n")
+    if ($Text.Contains($oldCrlf)) {
+        return $Text.Replace($oldCrlf, $newCrlf)
+    }
+    throw $ErrorMessage
+}
+
 $padCpp       = Join-Path $SourceRoot 'pcsx2\SIO\Pad\Pad.cpp'
 $ds2Cpp       = Join-Path $SourceRoot 'pcsx2\SIO\Pad\PadDualshock2.cpp'
 $cmake        = Join-Path $SourceRoot 'pcsx2\CMakeLists.txt'
 $vmManager    = Join-Path $SourceRoot 'pcsx2\VMManager.cpp'
 $mainWindow   = Join-Path $SourceRoot 'pcsx2-qt\MainWindow.cpp'
+$qtHost       = Join-Path $SourceRoot 'pcsx2-qt\QtHost.cpp'
 $qtCmake      = Join-Path $SourceRoot 'pcsx2-qt\CMakeLists.txt'
 
 # Pad.cpp: include Netplay service, force virtual controller port 2 to DS2 while Netplay is configured,
@@ -93,8 +106,7 @@ endif()
 }
 Write-Text $cmake $text
 
-# Keep a VMManager hook available for later deterministic tuning. In v0.4 the
-# implementation is intentionally non-invasive; diagnostics are collected first.
+# Keep the existing VMManager hook for later deterministic settings/memory-card shadowing.
 $text = Read-Text $vmManager
 if ($text -notmatch '#include "Netplay/ModernNetplay.h"') {
     $needle = '#include "VMManager.h"'
@@ -148,6 +160,79 @@ if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
 }
 Write-Text $mainWindow $text
 
+# QtHost: in a configured Netplay instance, ordinary game boot is blocked until
+# the room has issued PREPARE_BOOT. Once VM initialization completes, both peers
+# stop at BOOT_READY and only enter Running after host START_COMMIT.
+$text = Read-Text $qtHost
+if ($text -notmatch '#include "Netplay/ModernNetplay.h"') {
+    $needle = '#include "QtHost.h"'
+    if (-not $text.Contains($needle)) { throw "QtHost.cpp include anchor not found" }
+    $text = $text.Replace($needle, "$needle`r`n#include `"Netplay/ModernNetplay.h`"")
+}
+
+if ($text -notmatch 'NETPLAY_SYNCHRONIZED_BOOT_GUARD') {
+    $needle = "`t// Determine whether to start fullscreen or not."
+    if (-not $text.Contains($needle)) { throw "QtHost.cpp startVM guard anchor not found" }
+    $guard = @'
+	// NETPLAY_SYNCHRONIZED_BOOT_GUARD
+	if (ModernNetplay::IsConfigured() && !ModernNetplay::CanStartVM())
+	{
+		Host::ReportErrorAsync("Netplay", "This Netplay instance can only boot a game from the synchronized room Start flow.");
+		return;
+	}
+
+'@
+    $text = $text.Replace($needle, $guard + $needle)
+}
+
+if ($text -notmatch 'NETPLAY_BOOT_READY_BARRIER') {
+    $oldDone = @'
+		if (!Host::GetBoolSettingValue("UI", "StartPaused", false))
+		{
+			// This will come back and call OnVMResumed().
+			VMManager::SetState(VMState::Running);
+		}
+		else
+		{
+			// When starting paused, redraw the window, so there's at least something there.
+			g_emu_thread->redrawDisplayWindow();
+			Host::OnVMPaused();
+		}
+'@
+    $newDone = @'
+		// NETPLAY_BOOT_READY_BARRIER
+		if (ModernNetplay::ShouldHoldBootBarrier())
+		{
+			VMManager::SetState(VMState::Paused);
+			ModernNetplay::NotifyBootReady();
+			if (ModernNetplay::WaitForStartCommit())
+			{
+				// This will come back and call OnVMResumed().
+				VMManager::SetState(VMState::Running);
+			}
+			else
+			{
+				g_emu_thread->redrawDisplayWindow();
+				Host::OnVMPaused();
+				Host::ReportErrorAsync("Netplay", "Synchronized boot timed out. The VM remains paused; collect both Netplay logs.");
+			}
+		}
+		else if (!Host::GetBoolSettingValue("UI", "StartPaused", false))
+		{
+			// This will come back and call OnVMResumed().
+			VMManager::SetState(VMState::Running);
+		}
+		else
+		{
+			// When starting paused, redraw the window, so there's at least something there.
+			g_emu_thread->redrawDisplayWindow();
+			Host::OnVMPaused();
+		}
+'@
+    $text = Replace-Portable $text $oldDone $newDone "QtHost.cpp done_callback barrier anchor not found"
+}
+Write-Text $qtHost $text
+
 # Qt target: compile the programmatic Netplay dialog.
 $text = Read-Text $qtCmake
 if ($text -notmatch 'NetplayDialog.cpp') {
@@ -163,4 +248,4 @@ target_sources(pcsx2-qt PRIVATE
 }
 Write-Text $qtCmake $text
 
-Write-Host 'Modern Netplay v0.4 stable core + pre-game lobby + diagnostics patch applied successfully.' -ForegroundColor Green
+Write-Host 'Modern Netplay v0.5a synchronized game validation + boot barrier patch applied successfully.' -ForegroundColor Green

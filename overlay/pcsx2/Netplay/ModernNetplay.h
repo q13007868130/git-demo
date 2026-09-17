@@ -8,39 +8,63 @@
 
 namespace ModernNetplay
 {
-	struct StatusSnapshot
-	{
-		bool configured = false;
-		bool connecting = false;
-		bool connected = false;
-		bool failed = false;
-		std::uint32_t player_count = 0;
-		std::uint32_t delay = 2;
-		std::uint16_t port = 27886;
-		std::string role;
-		std::string peer;
-		std::string last_error;
-		std::string log_path;
-	};
+    struct StatusSnapshot
+    {
+        bool configured = false;
+        bool connecting = false;
+        bool connected = false;
+        bool failed = false;
+        std::uint32_t player_count = 0;
+        std::uint32_t delay = 2;
+        std::uint16_t port = 27886;
+        std::string role;
+        std::string peer;
+        std::string last_error;
+        std::string log_path;
 
-	// True when PCSX2 was launched with PCSX2_NETPLAY_MODE=host/client.
-	bool IsConfigured();
+        bool game_selected = false;
+        bool local_game_match = false;
+        bool peer_game_match = false;
+        std::string game_title;
+        std::string game_serial;
+        std::uint32_t game_crc = 0;
+        std::string local_game_path;
 
-	// Starts the host accept/client connect path on a background thread so the
-	// Netplay dialog can behave like a real 1/2 -> 2/2 lobby before a game boots.
-	void StartSessionAsync();
+        bool prepare_boot = false;
+        bool local_boot_ready = false;
+        bool peer_boot_ready = false;
+        bool start_committed = false;
+        bool first_poll_released = false;
+    };
 
-	// Lightweight thread-safe state used by the Qt lobby/status panel.
-	StatusSnapshot GetStatusSnapshot();
+    bool IsConfigured();
+    void StartSessionAsync();
+    StatusSnapshot GetStatusSnapshot();
 
-	// v0.4 deliberately keeps the proven v0.1 input semantics. Determinism checks
-	// are diagnostic-only until the logs prove which settings are safe to enforce.
-	void ApplyDeterministicConfig();
+    // Host announces the exact local game selected in the room. The path is
+    // local-only; peers receive title/serial/CRC and resolve their own image.
+    bool HostSelectGame(const std::string& path, const std::string& title,
+        const std::string& serial, std::uint32_t crc);
 
-	// Intercepts the first six DualShock 2 POLL response bytes (two digital + four analog),
-	// matching the synchronization boundary used by the old PCSX2 Online/1.5-era netplay code.
-	std::uint8_t HandlePadResponse(std::uint8_t unified_slot, std::uint32_t command_index, std::uint8_t local_value);
+    // Host-only synchronized boot request. Both peers launch their matching
+    // local image, initialize the VM, wait at BOOT_READY, then enter Running
+    // only after the host broadcasts START_COMMIT.
+    bool RequestSynchronizedBoot();
+    bool ConsumeBootLaunchRequest(std::string* path);
 
-	// Stops networking and wakes any emulation thread blocked waiting for a peer frame.
-	void Shutdown();
+    // EmuThread integration used to prevent normal/double-click boot from
+    // bypassing the Netplay room and to hold initialized VMs at the barrier.
+    bool CanStartVM();
+    bool ShouldHoldBootBarrier();
+    void NotifyBootReady();
+    bool WaitForStartCommit();
+
+    void ApplyDeterministicConfig();
+
+    // Intercepts the first six DualShock 2 POLL response bytes (two digital +
+    // four analog), preserving the working v0.1 lockstep input semantics.
+    std::uint8_t HandlePadResponse(std::uint8_t unified_slot,
+        std::uint32_t command_index, std::uint8_t local_value);
+
+    void Shutdown();
 } // namespace ModernNetplay
