@@ -6,6 +6,7 @@
 #include "Config.h"
 #include "Counters.h"
 #include "GameList.h"
+#include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Memcard/MemoryCardFolder.h"
 
 #include <algorithm>
