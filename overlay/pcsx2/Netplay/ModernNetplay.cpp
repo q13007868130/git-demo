@@ -3,8 +3,10 @@
 
 #include "Netplay/ModernNetplay.h"
 
+#include "Config.h"
 #include "Counters.h"
 #include "GameList.h"
+#include "SIO/Memcard/MemoryCardFolder.h"
 
 #include <algorithm>
 #include <array>
@@ -17,7 +19,9 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -35,16 +39,20 @@ namespace ModernNetplay
 namespace
 {
     using InputFrame = std::array<std::uint8_t, 6>;
+    using InputBundle = std::array<InputFrame, MAX_PLAYERS>;
 
     constexpr std::uint32_t HELLO_MAGIC = 0x50324E50;   // P2NP
-    constexpr std::uint32_t FRAME_MAGIC = 0x46524D45;   // FRME
+    constexpr std::uint32_t INPUT_MAGIC = 0x494E5054;   // INPT
+    constexpr std::uint32_t BUNDLE_MAGIC = 0x424E444C;  // BNDL
     constexpr std::uint32_t CONTROL_MAGIC = 0x43544C31; // CTL1
-    constexpr std::uint32_t PROTOCOL_VERSION = 2;
+    constexpr std::uint32_t PROTOCOL_VERSION = 3;
     constexpr std::uint16_t DEFAULT_PORT = 27886;
     constexpr int RECEIVE_TIMEOUT_SECONDS = 30;
-    constexpr int BOOT_BARRIER_TIMEOUT_SECONDS = 60;
+    constexpr int BOOT_BARRIER_TIMEOUT_SECONDS = 90;
     constexpr std::uint32_t LOG_FRAME_INTERVAL = 120;
-    constexpr std::uint32_t MAX_CONTROL_PAYLOAD = 4096;
+    constexpr std::uint32_t MAX_CONTROL_PAYLOAD = 64 * 1024;
+    constexpr std::uint32_t MEMCARD_CHUNK = 60 * 1024;
+    constexpr std::size_t HELLO_SIZE = 80;
     constexpr InputFrame NEUTRAL_FRAME = {0xff, 0xff, 0x7f, 0x7f, 0x7f, 0x7f};
 
     enum class Role : std::uint32_t
@@ -56,13 +64,38 @@ namespace
 
     enum class ControlType : std::uint32_t
     {
-        GameManifest = 1,
-        GameMatch = 2,
-        PrepareBoot = 3,
-        BootReady = 4,
-        StartCommit = 5,
-        FirstPollReady = 6,
-        FirstPollGo = 7,
+        Roster = 1,
+        GameManifest = 2,
+        GameMatch = 3,
+        MemcardBegin = 4,
+        MemcardChunk = 5,
+        MemcardEnd = 6,
+        MemcardReady = 7,
+        PrepareBoot = 8,
+        BootReady = 9,
+        StartCommit = 10,
+        FirstPollReady = 11,
+        FirstPollGo = 12,
+    };
+
+    struct PlayerState
+    {
+        bool connected = false;
+        bool game_match = false;
+        bool memcard_ready = false;
+        bool boot_ready = false;
+        bool first_poll_ready = false;
+        std::string name;
+    };
+
+    struct Peer
+    {
+        SOCKET socket = INVALID_SOCKET;
+        std::uint32_t player_id = 0;
+        std::string name;
+        std::mutex send_mutex;
+        std::thread receiver;
+        std::atomic<bool> connected{false};
     };
 
     void WriteU32(std::uint8_t* dst, std::uint32_t value)
@@ -76,6 +109,29 @@ namespace
         std::uint32_t value;
         std::memcpy(&value, src, sizeof(value));
         return ntohl(value);
+    }
+
+    void WriteU64(std::uint8_t* dst, std::uint64_t value)
+    {
+        WriteU32(dst, static_cast<std::uint32_t>(value >> 32));
+        WriteU32(dst + 4, static_cast<std::uint32_t>(value & 0xffffffffu));
+    }
+
+    std::uint64_t ReadU64(const std::uint8_t* src)
+    {
+        return (static_cast<std::uint64_t>(ReadU32(src)) << 32) |
+            static_cast<std::uint64_t>(ReadU32(src + 4));
+    }
+
+    std::uint64_t HashBytes(const std::vector<std::uint8_t>& data)
+    {
+        std::uint64_t hash = 1469598103934665603ull;
+        for (const std::uint8_t value : data)
+        {
+            hash ^= value;
+            hash *= 1099511628211ull;
+        }
+        return hash;
     }
 
     bool SendAll(SOCKET socket, const void* data, std::size_t size)
@@ -112,14 +168,20 @@ namespace
         Session()
         {
             ReadConfiguration();
-            if (m_role != Role::Disabled)
-            {
-                OpenLog();
-                Log("session configured: role=%s host=%s port=%u delay=%u protocol=%u",
-                    RoleName(), m_host.c_str(), static_cast<unsigned>(m_port),
-                    static_cast<unsigned>(m_delay.load()), static_cast<unsigned>(PROTOCOL_VERSION));
-                Log("v0.5a boot-barrier preview: strict game manifest + synchronized VM start + first-poll barrier");
-            }
+            if (m_role == Role::Disabled)
+                return;
+
+            m_session_id = static_cast<std::uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+            m_players[0].connected = (m_role == Role::Host);
+            m_players[0].name = (m_role == Role::Host) ? m_username : std::string("房主");
+            if (m_role == Role::Host)
+                m_local_player_id = 1;
+
+            OpenLog();
+            Log("session configured: role=%s user=%s port=%u players=%u delay=%u memcard=%s protocol=%u",
+                RoleName(), m_username.c_str(), static_cast<unsigned>(m_port), static_cast<unsigned>(m_max_players),
+                static_cast<unsigned>(m_delay.load()), m_memory_card_sync_enabled ? "on" : "off",
+                static_cast<unsigned>(PROTOCOL_VERSION));
         }
 
         ~Session()
@@ -127,23 +189,38 @@ namespace
             Stop();
         }
 
-        bool IsConfigured() const
-        {
-            return m_role != Role::Disabled;
-        }
+        bool IsConfigured() const { return m_role != Role::Disabled; }
 
         void StartSessionAsync()
         {
-            if (!IsConfigured() || m_connected.load(std::memory_order_acquire) ||
-                m_failed.load(std::memory_order_acquire) || m_stop_requested.load(std::memory_order_acquire))
+            if (!IsConfigured() || m_stop_requested.load(std::memory_order_acquire) ||
+                m_failed.load(std::memory_order_acquire))
                 return;
 
             bool expected = false;
             if (!m_connect_worker_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
                 return;
 
-            Log("lobby connection worker started");
-            m_connector = std::thread([this]() { EnsureConnected(); });
+            if (!StartWinsock())
+            {
+                Fail("WSAStartup failed");
+                return;
+            }
+
+            if (m_role == Role::Host)
+            {
+                m_connected.store(true, std::memory_order_release);
+                m_connecting.store(m_max_players > 1, std::memory_order_release);
+                if (m_max_players > 1)
+                    m_connector = std::thread([this]() { AcceptLoop(); });
+                else
+                    Log("single-player room ready");
+            }
+            else
+            {
+                m_connecting.store(true, std::memory_order_release);
+                m_connector = std::thread([this]() { ClientConnectAndReceive(); });
+            }
         }
 
         StatusSnapshot GetStatusSnapshot() const
@@ -153,54 +230,81 @@ namespace
             out.connecting = m_connecting.load(std::memory_order_acquire);
             out.connected = m_connected.load(std::memory_order_acquire);
             out.failed = m_failed.load(std::memory_order_acquire);
-            out.player_count = out.configured ? (out.connected ? 2u : 1u) : 0u;
             out.delay = m_delay.load(std::memory_order_acquire);
             out.port = m_port;
             out.role = RoleName();
+            out.username = m_username;
+
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            out.max_players = m_max_players;
+            out.local_player_id = m_local_player_id;
+            out.session_id = m_session_id;
+            out.last_error = m_last_error;
+            out.log_path = m_log_path;
+            out.player_count = ConnectedCountLocked();
+            out.room_full = (out.player_count == m_max_players);
+            for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
             {
-                std::lock_guard<std::mutex> lock(m_state_mutex);
-                out.peer = m_peer;
-                out.last_error = m_last_error;
-                out.log_path = m_log_path;
-                out.game_selected = m_game_selected;
-                out.local_game_match = m_local_game_match;
-                out.peer_game_match = m_peer_game_match;
-                out.prepare_boot = m_prepare_boot;
-                out.local_boot_ready = m_local_boot_ready;
-                out.peer_boot_ready = m_peer_boot_ready;
-                out.start_committed = m_start_committed;
-                out.first_poll_released = m_first_poll_go;
-                out.game_title = m_game_title;
-                out.game_serial = m_game_serial;
-                out.game_crc = m_game_crc;
-                out.local_game_path = m_local_game_path;
+                out.players[i].id = i + 1;
+                out.players[i].connected = m_players[i].connected;
+                out.players[i].game_match = m_players[i].game_match;
+                out.players[i].memcard_ready = m_players[i].memcard_ready;
+                out.players[i].boot_ready = m_players[i].boot_ready;
+                out.players[i].name = m_players[i].name;
             }
+
+            out.game_selected = m_game_selected;
+            out.local_game_match = m_local_game_match;
+            out.all_games_match = AllGamesMatchLocked();
+            out.game_title = m_game_title;
+            out.game_serial = m_game_serial;
+            out.game_crc = m_game_crc;
+            out.local_game_path = m_local_game_path;
+
+            out.memory_card_sync_enabled = m_memory_card_sync_enabled;
+            out.memory_card_local_ready = m_memory_card_local_ready;
+            out.memory_card_all_ready = AllMemcardsReadyLocked();
+            out.memory_card_present = m_memory_card_present;
+            out.memory_card_crc = m_memory_card_crc;
+            out.memory_card_size = m_memory_card_size;
+            out.memory_card_status = m_memory_card_status;
+
+            out.start_requested = m_start_requested;
+            out.prepare_boot = m_prepare_boot;
+            out.local_boot_ready = m_local_boot_ready;
+            out.all_boot_ready = AllBootReadyLocked();
+            out.start_committed = m_start_committed;
+            out.first_poll_released = m_first_poll_go;
             return out;
         }
 
-        bool HostSelectGame(const std::string& path, const std::string& title, const std::string& serial, std::uint32_t crc)
+        bool HostSelectGame(const std::string& path, const std::string& title,
+            const std::string& serial, std::uint32_t crc)
         {
             if (m_role != Role::Host || path.empty() || serial.empty() || crc == 0)
                 return false;
 
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (m_prepare_boot)
+                if (m_prepare_boot || ConnectedCountLocked() != m_max_players)
                     return false;
+
                 m_game_selected = true;
                 m_local_game_match = true;
-                m_peer_game_match = false;
                 m_game_title = title;
                 m_game_serial = serial;
                 m_game_crc = crc;
                 m_local_game_path = path;
-                ResetBootStateLocked();
+                ResetStartStateLocked();
+                for (std::uint32_t i = 0; i < m_max_players; i++)
+                    m_players[i].game_match = (i == 0);
             }
 
             Log("host selected game: title=%s serial=%s crc=%08X", title.c_str(), serial.c_str(), crc);
-            if (m_connected.load(std::memory_order_acquire) && !SendGameManifest())
+            BroadcastRoster();
+            if (!BroadcastGameManifest())
             {
-                Fail("failed to send game manifest");
+                Fail("failed to broadcast game manifest");
                 return false;
             }
             return true;
@@ -208,25 +312,18 @@ namespace
 
         bool RequestSynchronizedBoot()
         {
-            if (m_role != Role::Host || !m_connected.load(std::memory_order_acquire))
+            if (m_role != Role::Host || !m_game_selected)
                 return false;
 
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (!m_game_selected || !m_local_game_match || !m_peer_game_match || m_prepare_boot)
+                if (ConnectedCountLocked() != m_max_players || m_prepare_boot)
                     return false;
-                ResetBootStateLocked();
-                m_prepare_boot = true;
-                m_boot_launch_pending = true;
+                m_start_requested = true;
             }
 
-            if (!SendControl(ControlType::PrepareBoot, nullptr, 0))
-            {
-                Fail("failed to send PREPARE_BOOT");
-                return false;
-            }
-
-            Log("PREPARE_BOOT sent; both VMs must initialize and stop at boot barrier");
+            Log("start requested; waiting for game match and memory-card synchronization");
+            MaybeAdvanceStart();
             return true;
         }
 
@@ -255,23 +352,28 @@ namespace
 
         void NotifyBootReady()
         {
-            bool send_ready = false;
+            bool send_to_host = false;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 if (!m_prepare_boot || m_local_boot_ready)
                     return;
                 m_local_boot_ready = true;
-                send_ready = true;
+                if (m_local_player_id >= 1 && m_local_player_id <= MAX_PLAYERS)
+                    m_players[m_local_player_id - 1].boot_ready = true;
+                send_to_host = (m_role == Role::Client);
             }
 
-            if (send_ready && !SendControl(ControlType::BootReady, nullptr, 0))
+            Log("BOOT_READY: local VM initialized and waiting");
+            if (send_to_host && !SendControlToHost(ControlType::BootReady, nullptr, 0))
             {
                 Fail("failed to send BOOT_READY");
                 return;
             }
-
-            Log("BOOT_READY: local VM initialized and waiting");
-            MaybeCommitStart();
+            if (m_role == Role::Host)
+            {
+                BroadcastRoster();
+                MaybeCommitStart();
+            }
             m_boot_cv.notify_all();
         }
 
@@ -292,32 +394,82 @@ namespace
             return true;
         }
 
-        std::uint8_t HandlePadResponse(std::uint8_t unified_slot, std::uint32_t command_index, std::uint8_t local_value)
+        bool ShouldForceDualShock2Slot(std::uint32_t slot) const
+        {
+            if (!IsConfigured())
+                return false;
+            const std::uint32_t players = m_max_players;
+            if (players <= 2)
+                return slot < players;
+            if (slot == 0)
+                return true;
+            if (slot >= 2 && slot <= 4)
+                return (slot - 1) < players;
+            return false;
+        }
+
+        bool ShouldDisconnectControllerSlot(std::uint32_t slot) const
+        {
+            return IsConfigured() && !ShouldForceDualShock2Slot(slot);
+        }
+
+        void ApplyDeterministicConfig()
+        {
+            if (!IsConfigured())
+                return;
+
+            EmuConfig.Pad.MultitapPort0_Enabled = (m_max_players >= 3);
+            EmuConfig.Pad.MultitapPort1_Enabled = false;
+
+            std::string shadow_name;
+            bool memcard_ready = false;
+            bool memcard_present = false;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                memcard_ready = m_memory_card_local_ready;
+                memcard_present = m_memory_card_present;
+                shadow_name = m_shadow_card_filename;
+            }
+
+            if (!m_memory_card_sync_enabled || !memcard_ready)
+                return;
+
+            for (std::uint32_t i = 0; i < 8; i++)
+                EmuConfig.Mcd[i].Enabled = false;
+
+            if (memcard_present && !shadow_name.empty())
+            {
+                EmuConfig.Mcd[0].Enabled = true;
+                EmuConfig.Mcd[0].Type = MemoryCardType::File;
+                EmuConfig.Mcd[0].Filename = shadow_name;
+            }
+        }
+
+        std::uint8_t HandlePadResponse(std::uint8_t unified_slot,
+            std::uint32_t command_index, std::uint8_t local_value)
         {
             if (m_role == Role::Disabled || command_index < 3 || command_index > 8)
                 return local_value;
 
             const std::size_t input_index = static_cast<std::size_t>(command_index - 3);
-
             if (unified_slot == 0 && command_index == 3)
             {
                 if (!BeginPadPoll())
                     return local_value;
             }
 
-            if (!m_connected.load(std::memory_order_acquire))
+            if (!m_start_committed || !m_connected.load(std::memory_order_acquire))
                 return local_value;
 
+            // Every PC binds its physical controller to Pad1. Capture that raw
+            // input before replacing Pad1 with the authoritative room bundle.
             if (unified_slot == 0)
-            {
                 m_capture[input_index] = local_value;
-                return (m_role == Role::Host) ? m_local_output[input_index] : m_remote_output[input_index];
-            }
 
-            if (unified_slot == 1)
-                return (m_role == Role::Host) ? m_remote_output[input_index] : m_local_output[input_index];
-
-            return local_value;
+            const int player_index = SlotToPlayerIndex(unified_slot);
+            if (player_index < 0)
+                return local_value;
+            return m_output_bundle[static_cast<std::size_t>(player_index)][input_index];
         }
 
         void Stop()
@@ -326,10 +478,11 @@ namespace
                 return;
 
             Log("session shutdown requested");
-            m_running.store(false, std::memory_order_release);
             m_connected.store(false, std::memory_order_release);
             m_connecting.store(false, std::memory_order_release);
-            m_remote_cv.notify_all();
+            m_running.store(false, std::memory_order_release);
+            m_input_cv.notify_all();
+            m_bundle_cv.notify_all();
             m_boot_cv.notify_all();
             m_first_poll_cv.notify_all();
 
@@ -337,22 +490,43 @@ namespace
             if (listener != INVALID_SOCKET)
                 closesocket(listener);
 
-            SOCKET socket = INVALID_SOCKET;
             {
-                std::lock_guard<std::mutex> lock(m_socket_mutex);
-                socket = m_socket;
-                m_socket = INVALID_SOCKET;
+                std::lock_guard<std::mutex> lock(m_client_socket_mutex);
+                if (m_client_socket != INVALID_SOCKET)
+                {
+                    shutdown(m_client_socket, SD_BOTH);
+                    closesocket(m_client_socket);
+                    m_client_socket = INVALID_SOCKET;
+                }
             }
-            if (socket != INVALID_SOCKET)
+
             {
-                shutdown(socket, SD_BOTH);
-                closesocket(socket);
+                std::lock_guard<std::mutex> lock(m_peer_mutex);
+                for (auto& peer : m_peers)
+                {
+                    if (peer && peer->socket != INVALID_SOCKET)
+                    {
+                        shutdown(peer->socket, SD_BOTH);
+                        closesocket(peer->socket);
+                        peer->socket = INVALID_SOCKET;
+                    }
+                }
             }
 
             if (m_connector.joinable() && m_connector.get_id() != std::this_thread::get_id())
                 m_connector.join();
-            if (m_receiver.joinable() && m_receiver.get_id() != std::this_thread::get_id())
-                m_receiver.join();
+
+            std::array<std::thread*, 3> threads{};
+            {
+                std::lock_guard<std::mutex> lock(m_peer_mutex);
+                for (std::size_t i = 0; i < m_peers.size(); i++)
+                    threads[i] = m_peers[i] ? &m_peers[i]->receiver : nullptr;
+            }
+            for (std::thread* thread : threads)
+            {
+                if (thread && thread->joinable() && thread->get_id() != std::this_thread::get_id())
+                    thread->join();
+            }
 
             if (m_winsock_started)
             {
@@ -388,18 +562,38 @@ namespace
             else
                 return;
 
+            if (const char* username = std::getenv("PCSX2_NETPLAY_USERNAME"))
+                m_username = username;
+            if (m_username.empty())
+                m_username = (m_role == Role::Host) ? "房主" : "玩家";
+            if (m_username.size() > 38)
+                m_username.resize(38);
+
             if (const char* host = std::getenv("PCSX2_NETPLAY_HOST"))
                 m_host = host;
-
             if (const char* port = std::getenv("PCSX2_NETPLAY_PORT"))
             {
                 const int value = std::atoi(port);
                 if (value > 0 && value <= 65535)
                     m_port = static_cast<std::uint16_t>(value);
             }
-
             if (const char* delay = std::getenv("PCSX2_NETPLAY_DELAY"))
                 m_delay.store(static_cast<std::uint32_t>(std::clamp(std::atoi(delay), 1, 12)), std::memory_order_release);
+            if (const char* players = std::getenv("PCSX2_NETPLAY_PLAYERS"))
+                m_max_players = static_cast<std::uint32_t>(std::clamp(std::atoi(players), 1, 4));
+            if (const char* sync = std::getenv("PCSX2_NETPLAY_MEMCARD_SYNC"))
+                m_memory_card_sync_enabled = (std::atoi(sync) != 0);
+        }
+
+        bool StartWinsock()
+        {
+            if (m_winsock_started)
+                return true;
+            WSADATA data{};
+            if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
+                return false;
+            m_winsock_started = true;
+            return true;
         }
 
         void OpenLog()
@@ -407,20 +601,17 @@ namespace
             std::error_code ec;
             const std::filesystem::path dir = std::filesystem::path("logs") / "netplay";
             std::filesystem::create_directories(dir, ec);
-
             std::time_t now = std::time(nullptr);
             std::tm local_tm{};
             localtime_s(&local_tm, &now);
             char stamp[32]{};
             std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local_tm);
-
             const std::string filename = std::string("netplay-") + stamp + "-" + RoleName() + ".log";
             const std::filesystem::path file_path = dir / filename;
             FILE* file = nullptr;
             if (fopen_s(&file, file_path.string().c_str(), "wb") == 0)
                 m_log_file = file;
-
-            std::filesystem::path absolute_path = std::filesystem::absolute(file_path, ec);
+            const std::filesystem::path absolute_path = std::filesystem::absolute(file_path, ec);
             std::lock_guard<std::mutex> lock(m_state_mutex);
             m_log_path = ec ? file_path.string() : absolute_path.string();
         }
@@ -442,10 +633,8 @@ namespace
             va_start(args, format);
             std::vsnprintf(message, sizeof(message), format, args);
             va_end(args);
-
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - m_session_started).count();
-
             std::lock_guard<std::mutex> lock(m_log_mutex);
             std::fprintf(stderr, "[ModernNetplay +%lldms] %s\n", static_cast<long long>(elapsed), message);
             if (m_log_file)
@@ -461,227 +650,226 @@ namespace
             m_last_error = message ? message : "unknown error";
         }
 
-        void ResetBootStateLocked()
+        std::uint32_t ConnectedCountLocked() const
         {
+            std::uint32_t count = 0;
+            for (std::uint32_t i = 0; i < m_max_players; i++)
+                count += m_players[i].connected ? 1u : 0u;
+            return count;
+        }
+
+        bool AllGamesMatchLocked() const
+        {
+            if (!m_game_selected || ConnectedCountLocked() != m_max_players)
+                return false;
+            for (std::uint32_t i = 0; i < m_max_players; i++)
+            {
+                if (!m_players[i].connected || !m_players[i].game_match)
+                    return false;
+            }
+            return true;
+        }
+
+        bool AllMemcardsReadyLocked() const
+        {
+            if (!m_memory_card_sync_enabled)
+                return true;
+            if (ConnectedCountLocked() != m_max_players)
+                return false;
+            for (std::uint32_t i = 0; i < m_max_players; i++)
+            {
+                if (!m_players[i].connected || !m_players[i].memcard_ready)
+                    return false;
+            }
+            return true;
+        }
+
+        bool AllBootReadyLocked() const
+        {
+            if (!m_prepare_boot || ConnectedCountLocked() != m_max_players)
+                return false;
+            for (std::uint32_t i = 0; i < m_max_players; i++)
+            {
+                if (!m_players[i].connected || !m_players[i].boot_ready)
+                    return false;
+            }
+            return true;
+        }
+
+        bool AllFirstPollReadyLocked() const
+        {
+            if (!m_prepare_boot || ConnectedCountLocked() != m_max_players)
+                return false;
+            for (std::uint32_t i = 0; i < m_max_players; i++)
+            {
+                if (!m_players[i].connected || !m_players[i].first_poll_ready)
+                    return false;
+            }
+            return true;
+        }
+
+        void ResetStartStateLocked()
+        {
+            m_start_requested = false;
+            m_memcard_transfer_started = false;
+            m_memory_card_local_ready = false;
+            m_memory_card_present = false;
+            m_memory_card_crc = 0;
+            m_memory_card_size = 0;
+            m_memory_card_status = m_memory_card_sync_enabled ? "等待记忆卡同步" : "记忆卡同步已关闭";
+            m_shadow_card_filename.clear();
             m_prepare_boot = false;
             m_boot_launch_pending = false;
             m_boot_launch_consumed = false;
             m_local_boot_ready = false;
-            m_peer_boot_ready = false;
             m_start_committed = false;
-            m_local_first_poll_ready = false;
-            m_peer_first_poll_ready = false;
             m_first_poll_go = false;
             m_frame = 0;
             m_have_capture = false;
             m_capture = NEUTRAL_FRAME;
-            m_local_output = NEUTRAL_FRAME;
-            m_remote_output = NEUTRAL_FRAME;
-            m_local_frames.clear();
+            m_output_bundle.fill(NEUTRAL_FRAME);
+            for (auto& player : m_players)
             {
-                std::lock_guard<std::mutex> remote_lock(m_remote_mutex);
-                m_remote_frames.clear();
+                player.memcard_ready = false;
+                player.boot_ready = false;
+                player.first_poll_ready = false;
             }
+            for (auto& map : m_player_inputs)
+                map.clear();
+            m_bundles.clear();
         }
 
-        bool BeginPadPoll()
+        int SlotToPlayerIndex(std::uint32_t slot) const
         {
-            if (!EnsureConnected())
+            if (m_max_players <= 2)
+            {
+                if (slot < m_max_players)
+                    return static_cast<int>(slot);
+                return -1;
+            }
+            if (slot == 0)
+                return 0;
+            if (slot >= 2 && slot <= 4)
+            {
+                const std::uint32_t index = slot - 1;
+                return (index < m_max_players) ? static_cast<int>(index) : -1;
+            }
+            return -1;
+        }
+
+        bool BuildHello(std::array<std::uint8_t, HELLO_SIZE>* packet, Role role,
+            std::uint32_t max_players, std::uint32_t player_id, std::uint64_t session,
+            bool memcard_sync, const std::string& name) const
+        {
+            packet->fill(0);
+            WriteU32(packet->data() + 0, HELLO_MAGIC);
+            WriteU32(packet->data() + 4, PROTOCOL_VERSION);
+            WriteU32(packet->data() + 8, static_cast<std::uint32_t>(role));
+            WriteU32(packet->data() + 12, max_players);
+            WriteU32(packet->data() + 16, m_delay.load(std::memory_order_acquire));
+            WriteU32(packet->data() + 20, player_id);
+            WriteU64(packet->data() + 24, session);
+            WriteU32(packet->data() + 32, memcard_sync ? 1u : 0u);
+            std::snprintf(reinterpret_cast<char*>(packet->data() + 40), 40, "%s", name.c_str());
+            return true;
+        }
+
+        static std::string ReadHelloName(const std::array<std::uint8_t, HELLO_SIZE>& packet)
+        {
+            const char* ptr = reinterpret_cast<const char*>(packet.data() + 40);
+            std::size_t length = 0;
+            while (length < 40 && ptr[length] != '\0')
+                ++length;
+            return std::string(ptr, length);
+        }
+
+        std::uint32_t FindFreePlayerIdLocked() const
+        {
+            for (std::uint32_t id = 2; id <= m_max_players; id++)
+            {
+                if (!m_players[id - 1].connected)
+                    return id;
+            }
+            return 0;
+        }
+
+        bool HostHandshake(SOCKET socket, std::uint32_t* player_id, std::string* name)
+        {
+            std::array<std::uint8_t, HELLO_SIZE> incoming{};
+            if (!ReceiveAll(socket, incoming.data(), incoming.size()))
+                return false;
+            if (ReadU32(incoming.data()) != HELLO_MAGIC || ReadU32(incoming.data() + 4) != PROTOCOL_VERSION ||
+                ReadU32(incoming.data() + 8) != static_cast<std::uint32_t>(Role::Client))
                 return false;
 
+            std::uint32_t assigned = 0;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (m_prepare_boot && !m_start_committed)
-                    return false;
+                assigned = FindFreePlayerIdLocked();
             }
-
-            if (!WaitForFirstPollBarrier())
+            if (assigned == 0)
                 return false;
 
-            if (m_have_capture)
-            {
-                m_local_frames[m_frame] = m_capture;
-                if (!SendFrame(m_frame, m_capture))
-                {
-                    Fail("failed to send controller frame");
-                    return false;
-                }
-                ++m_frame;
-            }
-            else
-            {
-                m_have_capture = true;
-            }
+            std::string client_name = ReadHelloName(incoming);
+            if (client_name.empty())
+                client_name = "玩家" + std::to_string(assigned);
 
-            m_capture = NEUTRAL_FRAME;
-            m_local_output = NEUTRAL_FRAME;
-            m_remote_output = NEUTRAL_FRAME;
+            std::array<std::uint8_t, HELLO_SIZE> outgoing{};
+            BuildHello(&outgoing, Role::Host, m_max_players, assigned, m_session_id,
+                m_memory_card_sync_enabled, m_username);
+            if (!SendAll(socket, outgoing.data(), outgoing.size()))
+                return false;
 
-            if (m_frame >= m_delay.load(std::memory_order_acquire))
-            {
-                const std::uint32_t source_frame = m_frame - m_delay.load(std::memory_order_acquire);
-                const auto local = m_local_frames.find(source_frame);
-                if (local == m_local_frames.end())
-                {
-                    Fail("local delayed frame is missing");
-                    return false;
-                }
-                m_local_output = local->second;
-
-                if (!WaitForRemoteFrame(source_frame, &m_remote_output))
-                {
-                    Fail("timed out waiting for peer controller frame");
-                    return false;
-                }
-
-                if ((source_frame % LOG_FRAME_INTERVAL) == 0)
-                    LogFrameSummary(source_frame, m_local_output, m_remote_output);
-            }
-
-            PruneFrames();
+            *player_id = assigned;
+            *name = client_name;
             return true;
         }
 
-        bool WaitForFirstPollBarrier()
+        bool ClientHandshake(SOCKET socket)
         {
-            bool send_ready = false;
+            std::array<std::uint8_t, HELLO_SIZE> outgoing{};
+            BuildHello(&outgoing, Role::Client, 0, 0, 0, true, m_username);
+            if (!SendAll(socket, outgoing.data(), outgoing.size()))
+                return false;
+
+            std::array<std::uint8_t, HELLO_SIZE> incoming{};
+            if (!ReceiveAll(socket, incoming.data(), incoming.size()))
+                return false;
+            if (ReadU32(incoming.data()) != HELLO_MAGIC || ReadU32(incoming.data() + 4) != PROTOCOL_VERSION ||
+                ReadU32(incoming.data() + 8) != static_cast<std::uint32_t>(Role::Host))
+                return false;
+
+            const std::uint32_t max_players = ReadU32(incoming.data() + 12);
+            const std::uint32_t delay = ReadU32(incoming.data() + 16);
+            const std::uint32_t assigned = ReadU32(incoming.data() + 20);
+            if (max_players < 1 || max_players > MAX_PLAYERS || assigned < 2 || assigned > max_players)
+                return false;
+
+            const std::string host_name = ReadHelloName(incoming);
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (!m_prepare_boot)
-                    return true;
-                if (m_first_poll_go)
-                    return true;
-                if (!m_local_first_poll_ready)
-                {
-                    m_local_first_poll_ready = true;
-                    send_ready = true;
-                }
+                m_max_players = max_players;
+                m_local_player_id = assigned;
+                m_session_id = ReadU64(incoming.data() + 24);
+                m_memory_card_sync_enabled = (ReadU32(incoming.data() + 32) != 0);
+                m_players[0].connected = true;
+                m_players[0].name = host_name.empty() ? "房主" : host_name;
+                m_players[assigned - 1].connected = true;
+                m_players[assigned - 1].name = m_username;
             }
-
-            if (send_ready)
-            {
-                Log("FIRST_POLL_READY: local VM reached first synchronized DS2 poll");
-                if (!SendControl(ControlType::FirstPollReady, nullptr, 0))
-                {
-                    Fail("failed to send FIRST_POLL_READY");
-                    return false;
-                }
-            }
-
-            MaybeReleaseFirstPoll();
-
-            std::unique_lock<std::mutex> lock(m_state_mutex);
-            const bool released = m_first_poll_cv.wait_for(lock, std::chrono::seconds(BOOT_BARRIER_TIMEOUT_SECONDS), [this]() {
-                return m_first_poll_go || m_failed.load(std::memory_order_acquire) ||
-                    m_stop_requested.load(std::memory_order_acquire);
-            });
-            if (!released || !m_first_poll_go)
-            {
-                lock.unlock();
-                Fail("timed out waiting for FIRST_POLL_GO");
-                return false;
-            }
+            m_delay.store(std::clamp<std::uint32_t>(delay, 1, 12), std::memory_order_release);
             return true;
         }
 
-        void LogFrameSummary(std::uint32_t frame, const InputFrame& local, const InputFrame& remote)
-        {
-            Log("SYNC poll=%u vsync=%llu delay=%u wait_ms=%u local=%02x%02x%02x%02x%02x%02x remote=%02x%02x%02x%02x%02x%02x",
-                static_cast<unsigned>(frame), static_cast<unsigned long long>(g_FrameCount),
-                static_cast<unsigned>(m_delay.load(std::memory_order_acquire)),
-                static_cast<unsigned>(m_last_wait_ms.load(std::memory_order_acquire)),
-                static_cast<unsigned>(local[0]), static_cast<unsigned>(local[1]), static_cast<unsigned>(local[2]),
-                static_cast<unsigned>(local[3]), static_cast<unsigned>(local[4]), static_cast<unsigned>(local[5]),
-                static_cast<unsigned>(remote[0]), static_cast<unsigned>(remote[1]), static_cast<unsigned>(remote[2]),
-                static_cast<unsigned>(remote[3]), static_cast<unsigned>(remote[4]), static_cast<unsigned>(remote[5]));
-        }
-
-        bool EnsureConnected()
-        {
-            if (m_connected.load(std::memory_order_acquire))
-                return true;
-            if (m_failed.load(std::memory_order_acquire) || m_stop_requested.load(std::memory_order_acquire))
-                return false;
-
-            std::lock_guard<std::mutex> connect_lock(m_connect_mutex);
-            if (m_connected.load(std::memory_order_acquire))
-                return true;
-            if (m_failed.load(std::memory_order_acquire) || m_stop_requested.load(std::memory_order_acquire))
-                return false;
-
-            m_connecting.store(true, std::memory_order_release);
-
-            if (!m_winsock_started)
-            {
-                WSADATA data{};
-                if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
-                {
-                    m_connecting.store(false, std::memory_order_release);
-                    Fail("WSAStartup failed");
-                    return false;
-                }
-                m_winsock_started = true;
-            }
-
-            SOCKET socket = (m_role == Role::Host) ? AcceptPeer() : ConnectToHost();
-            if (socket == INVALID_SOCKET)
-            {
-                m_connecting.store(false, std::memory_order_release);
-                if (!m_stop_requested.load(std::memory_order_acquire))
-                    Fail("could not establish TCP connection");
-                return false;
-            }
-
-            BOOL no_delay = TRUE;
-            setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
-
-            if (!ExchangeHello(socket))
-            {
-                closesocket(socket);
-                m_connecting.store(false, std::memory_order_release);
-                if (!m_stop_requested.load(std::memory_order_acquire))
-                    Fail("Netplay handshake failed");
-                return false;
-            }
-
-            {
-                std::lock_guard<std::mutex> socket_lock(m_socket_mutex);
-                m_socket = socket;
-            }
-            m_running.store(true, std::memory_order_release);
-            m_connected.store(true, std::memory_order_release);
-            m_connecting.store(false, std::memory_order_release);
-            m_receiver = std::thread([this]() { ReceiverLoop(); });
-
-            Log("peer connected: protocol=%u delay=%u peer=%s",
-                static_cast<unsigned>(PROTOCOL_VERSION), static_cast<unsigned>(m_delay.load()),
-                GetStatusSnapshot().peer.c_str());
-
-            if (m_role == Role::Host)
-            {
-                bool selected = false;
-                {
-                    std::lock_guard<std::mutex> lock(m_state_mutex);
-                    selected = m_game_selected;
-                }
-                if (selected && !SendGameManifest())
-                {
-                    Fail("failed to announce selected game after connect");
-                    return false;
-                }
-            }
-
-            return true;
-        }
-
-        SOCKET AcceptPeer()
+        void AcceptLoop()
         {
             SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (listener == INVALID_SOCKET)
-                return INVALID_SOCKET;
-
+            {
+                Fail("failed to create listening socket");
+                return;
+            }
             m_listener.store(listener, std::memory_order_release);
-
             BOOL reuse = TRUE;
             setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
 
@@ -689,56 +877,88 @@ namespace
             address.sin_family = AF_INET;
             address.sin_addr.s_addr = htonl(INADDR_ANY);
             address.sin_port = htons(m_port);
-
             if (bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR ||
-                listen(listener, 1) == SOCKET_ERROR)
+                listen(listener, SOMAXCONN) == SOCKET_ERROR)
             {
-                if (m_listener.exchange(INVALID_SOCKET, std::memory_order_acq_rel) == listener)
-                    closesocket(listener);
-                return INVALID_SOCKET;
+                Fail("failed to bind/listen Netplay room");
+                return;
             }
 
-            Log("room open: TCP port %u, players=1/2, waiting for peer", static_cast<unsigned>(m_port));
-
-            SOCKET peer = INVALID_SOCKET;
+            Log("room open: TCP port %u, capacity=%u", static_cast<unsigned>(m_port), static_cast<unsigned>(m_max_players));
             while (!m_stop_requested.load(std::memory_order_acquire))
             {
+                {
+                    std::lock_guard<std::mutex> lock(m_state_mutex);
+                    m_connecting.store(ConnectedCountLocked() < m_max_players, std::memory_order_release);
+                }
+
                 fd_set read_set;
                 FD_ZERO(&read_set);
                 FD_SET(listener, &read_set);
                 timeval timeout{};
-                timeout.tv_sec = 0;
                 timeout.tv_usec = 250000;
                 const int ready = select(0, &read_set, nullptr, nullptr, &timeout);
-                if (ready > 0 && FD_ISSET(listener, &read_set))
-                {
-                    sockaddr_storage peer_address{};
-                    int peer_address_length = sizeof(peer_address);
-                    peer = accept(listener, reinterpret_cast<sockaddr*>(&peer_address), &peer_address_length);
-                    if (peer != INVALID_SOCKET)
-                    {
-                        char host[NI_MAXHOST]{};
-                        if (getnameinfo(reinterpret_cast<const sockaddr*>(&peer_address), peer_address_length,
-                            host, sizeof(host), nullptr, 0, NI_NUMERICHOST) == 0)
-                        {
-                            std::lock_guard<std::mutex> lock(m_state_mutex);
-                            m_peer = host;
-                        }
-                        break;
-                    }
-                }
-                else if (ready == SOCKET_ERROR)
-                {
+                if (ready == SOCKET_ERROR)
                     break;
-                }
-            }
+                if (ready <= 0 || !FD_ISSET(listener, &read_set))
+                    continue;
 
-            if (m_listener.exchange(INVALID_SOCKET, std::memory_order_acq_rel) == listener)
-                closesocket(listener);
-            return peer;
+                sockaddr_storage peer_address{};
+                int peer_address_length = sizeof(peer_address);
+                SOCKET socket_value = accept(listener, reinterpret_cast<sockaddr*>(&peer_address), &peer_address_length);
+                if (socket_value == INVALID_SOCKET)
+                    continue;
+
+                BOOL no_delay = TRUE;
+                setsockopt(socket_value, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
+
+                std::uint32_t player_id = 0;
+                std::string player_name;
+                if (!HostHandshake(socket_value, &player_id, &player_name))
+                {
+                    closesocket(socket_value);
+                    continue;
+                }
+
+                const std::size_t peer_index = static_cast<std::size_t>(player_id - 2);
+                std::unique_ptr<Peer> old_peer;
+                {
+                    std::lock_guard<std::mutex> lock(m_peer_mutex);
+                    old_peer = std::move(m_peers[peer_index]);
+                }
+                if (old_peer && old_peer->receiver.joinable())
+                    old_peer->receiver.join();
+
+                auto peer = std::make_unique<Peer>();
+                peer->socket = socket_value;
+                peer->player_id = player_id;
+                peer->name = player_name;
+                peer->connected.store(true, std::memory_order_release);
+                Peer* raw_peer = peer.get();
+                {
+                    std::lock_guard<std::mutex> lock(m_peer_mutex);
+                    m_peers[peer_index] = std::move(peer);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(m_state_mutex);
+                    m_players[player_id - 1].connected = true;
+                    m_players[player_id - 1].name = player_name;
+                }
+                raw_peer->receiver = std::thread([this, raw_peer]() { HostPeerReceiver(raw_peer); });
+                Log("P%u joined: %s", static_cast<unsigned>(player_id), player_name.c_str());
+                BroadcastRoster();
+
+                bool selected = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_state_mutex);
+                    selected = m_game_selected;
+                }
+                if (selected)
+                    SendGameManifestToPeer(*raw_peer);
+            }
         }
 
-        SOCKET ConnectToHost()
+        void ClientConnectAndReceive()
         {
             unsigned attempt = 0;
             while (!m_stop_requested.load(std::memory_order_acquire))
@@ -748,7 +968,6 @@ namespace
                 hints.ai_family = AF_UNSPEC;
                 hints.ai_socktype = SOCK_STREAM;
                 hints.ai_protocol = IPPROTO_TCP;
-
                 addrinfo* result = nullptr;
                 const std::string port = std::to_string(m_port);
                 if (getaddrinfo(m_host.c_str(), port.c_str(), &hints, &result) == 0)
@@ -769,229 +988,164 @@ namespace
                     freeaddrinfo(result);
                     if (connected != INVALID_SOCKET)
                     {
-                        std::lock_guard<std::mutex> lock(m_state_mutex);
-                        m_peer = m_host;
-                        return connected;
+                        BOOL no_delay = TRUE;
+                        setsockopt(connected, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
+                        if (ClientHandshake(connected))
+                        {
+                            {
+                                std::lock_guard<std::mutex> lock(m_client_socket_mutex);
+                                m_client_socket = connected;
+                            }
+                            m_connected.store(true, std::memory_order_release);
+                            m_connecting.store(false, std::memory_order_release);
+                            m_running.store(true, std::memory_order_release);
+                            Log("joined room: assigned=P%u players=%u delay=%u session=%016llX",
+                                static_cast<unsigned>(m_local_player_id), static_cast<unsigned>(m_max_players),
+                                static_cast<unsigned>(m_delay.load()), static_cast<unsigned long long>(m_session_id));
+                            ClientReceiverLoop(connected);
+                            return;
+                        }
+                        closesocket(connected);
                     }
                 }
-
                 if (attempt == 1 || (attempt % 10) == 0)
-                    Log("joining room: %s:%u, attempt=%u", m_host.c_str(), static_cast<unsigned>(m_port), attempt);
+                    Log("joining room: %s:%u attempt=%u", m_host.c_str(), static_cast<unsigned>(m_port), attempt);
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
-            return INVALID_SOCKET;
         }
 
-        bool ExchangeHello(SOCKET socket)
+        bool SendPacketLocked(SOCKET socket, std::mutex& mutex, const void* data, std::size_t size)
         {
-            std::array<std::uint8_t, 16> outgoing{};
-            WriteU32(outgoing.data() + 0, HELLO_MAGIC);
-            WriteU32(outgoing.data() + 4, PROTOCOL_VERSION);
-            WriteU32(outgoing.data() + 8, static_cast<std::uint32_t>(m_role));
-            WriteU32(outgoing.data() + 12, m_delay.load(std::memory_order_acquire));
-
-            std::array<std::uint8_t, 16> incoming{};
-            if (m_role == Role::Host)
-            {
-                if (!ReceiveAll(socket, incoming.data(), incoming.size()) || !ValidateHello(incoming, Role::Client))
-                    return false;
-                return SendAll(socket, outgoing.data(), outgoing.size());
-            }
-
-            if (!SendAll(socket, outgoing.data(), outgoing.size()) || !ReceiveAll(socket, incoming.data(), incoming.size()) ||
-                !ValidateHello(incoming, Role::Host))
-                return false;
-
-            m_delay.store(std::clamp<std::uint32_t>(ReadU32(incoming.data() + 12), 1, 12), std::memory_order_release);
-            return true;
+            std::lock_guard<std::mutex> lock(mutex);
+            return socket != INVALID_SOCKET && SendAll(socket, data, size);
         }
 
-        bool ValidateHello(const std::array<std::uint8_t, 16>& hello, Role expected_role) const
-        {
-            return ReadU32(hello.data() + 0) == HELLO_MAGIC && ReadU32(hello.data() + 4) == PROTOCOL_VERSION &&
-                ReadU32(hello.data() + 8) == static_cast<std::uint32_t>(expected_role);
-        }
-
-        bool SendFrame(std::uint32_t frame, const InputFrame& input)
-        {
-            std::array<std::uint8_t, 14> packet{};
-            WriteU32(packet.data() + 0, FRAME_MAGIC);
-            WriteU32(packet.data() + 4, frame);
-            std::memcpy(packet.data() + 8, input.data(), input.size());
-
-            std::lock_guard<std::mutex> lock(m_socket_mutex);
-            return m_socket != INVALID_SOCKET && SendAll(m_socket, packet.data(), packet.size());
-        }
-
-        bool SendControl(ControlType type, const void* payload, std::uint32_t size)
+        bool SendControlRaw(SOCKET socket, std::mutex& mutex, ControlType type,
+            const void* payload, std::uint32_t size)
         {
             if (size > MAX_CONTROL_PAYLOAD)
                 return false;
-
-            std::array<std::uint8_t, 12> header{};
-            WriteU32(header.data() + 0, CONTROL_MAGIC);
-            WriteU32(header.data() + 4, static_cast<std::uint32_t>(type));
-            WriteU32(header.data() + 8, size);
-
-            std::lock_guard<std::mutex> lock(m_socket_mutex);
-            if (m_socket == INVALID_SOCKET || !SendAll(m_socket, header.data(), header.size()))
-                return false;
-            return size == 0 || SendAll(m_socket, payload, size);
+            std::vector<std::uint8_t> packet(12u + size);
+            WriteU32(packet.data(), CONTROL_MAGIC);
+            WriteU32(packet.data() + 4, static_cast<std::uint32_t>(type));
+            WriteU32(packet.data() + 8, size);
+            if (size > 0)
+                std::memcpy(packet.data() + 12, payload, size);
+            return SendPacketLocked(socket, mutex, packet.data(), packet.size());
         }
 
-        bool SendGameManifest()
+        bool SendControlToHost(ControlType type, const void* payload, std::uint32_t size)
         {
-            std::array<std::uint8_t, 4 + 32 + 160> payload{};
+            std::lock_guard<std::mutex> socket_lock(m_client_socket_mutex);
+            return m_client_socket != INVALID_SOCKET && SendControlRaw(m_client_socket, m_client_send_mutex, type, payload, size);
+        }
+
+        bool SendControlToPeer(Peer& peer, ControlType type, const void* payload, std::uint32_t size)
+        {
+            return peer.connected.load(std::memory_order_acquire) &&
+                SendControlRaw(peer.socket, peer.send_mutex, type, payload, size);
+        }
+
+        void BroadcastControl(ControlType type, const void* payload, std::uint32_t size)
+        {
+            std::lock_guard<std::mutex> lock(m_peer_mutex);
+            for (auto& peer : m_peers)
+            {
+                if (peer && peer->connected.load(std::memory_order_acquire))
+                {
+                    if (!SendControlToPeer(*peer, type, payload, size))
+                        Log("warning: failed control send to P%u", static_cast<unsigned>(peer->player_id));
+                }
+            }
+        }
+
+        void BroadcastRoster()
+        {
+            if (m_role != Role::Host)
+                return;
+            std::array<std::uint8_t, 4 + MAX_PLAYERS * 44> payload{};
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (!m_game_selected)
-                    return false;
-                WriteU32(payload.data(), m_game_crc);
-                std::snprintf(reinterpret_cast<char*>(payload.data() + 4), 32, "%s", m_game_serial.c_str());
-                std::snprintf(reinterpret_cast<char*>(payload.data() + 36), 160, "%s", m_game_title.c_str());
+                WriteU32(payload.data(), m_max_players);
+                for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                {
+                    std::uint8_t* row = payload.data() + 4 + i * 44;
+                    WriteU32(row + 0, i + 1);
+                    std::uint32_t flags = 0;
+                    flags |= m_players[i].connected ? 1u : 0u;
+                    flags |= m_players[i].game_match ? 2u : 0u;
+                    flags |= m_players[i].memcard_ready ? 4u : 0u;
+                    flags |= m_players[i].boot_ready ? 8u : 0u;
+                    WriteU32(row + 4, flags);
+                    std::snprintf(reinterpret_cast<char*>(row + 8), 36, "%s", m_players[i].name.c_str());
+                }
             }
-            Log("GAME_MANIFEST sent");
-            return SendControl(ControlType::GameManifest, payload.data(), static_cast<std::uint32_t>(payload.size()));
+            BroadcastControl(ControlType::Roster, payload.data(), static_cast<std::uint32_t>(payload.size()));
         }
 
-        void ReceiverLoop()
+        bool BuildGameManifest(std::array<std::uint8_t, 4 + 32 + 160>* payload) const
         {
-            while (m_running.load(std::memory_order_acquire) && !m_stop_requested.load(std::memory_order_acquire))
-            {
-                SOCKET socket;
-                {
-                    std::lock_guard<std::mutex> lock(m_socket_mutex);
-                    socket = m_socket;
-                }
-                if (socket == INVALID_SOCKET)
-                    break;
-
-                std::array<std::uint8_t, 4> magic_bytes{};
-                if (!ReceiveAll(socket, magic_bytes.data(), magic_bytes.size()))
-                    break;
-
-                const std::uint32_t magic = ReadU32(magic_bytes.data());
-                if (magic == FRAME_MAGIC)
-                {
-                    std::array<std::uint8_t, 10> rest{};
-                    if (!ReceiveAll(socket, rest.data(), rest.size()))
-                        break;
-
-                    InputFrame input{};
-                    const std::uint32_t frame = ReadU32(rest.data());
-                    std::memcpy(input.data(), rest.data() + 4, input.size());
-                    {
-                        std::lock_guard<std::mutex> lock(m_remote_mutex);
-                        m_remote_frames[frame] = input;
-                    }
-                    m_remote_cv.notify_all();
-                    continue;
-                }
-
-                if (magic == CONTROL_MAGIC)
-                {
-                    std::array<std::uint8_t, 8> header_rest{};
-                    if (!ReceiveAll(socket, header_rest.data(), header_rest.size()))
-                        break;
-                    const ControlType type = static_cast<ControlType>(ReadU32(header_rest.data()));
-                    const std::uint32_t size = ReadU32(header_rest.data() + 4);
-                    if (size > MAX_CONTROL_PAYLOAD)
-                    {
-                        Fail("invalid Netplay control payload size");
-                        break;
-                    }
-                    std::vector<std::uint8_t> payload(size);
-                    if (size > 0 && !ReceiveAll(socket, payload.data(), payload.size()))
-                        break;
-                    HandleControl(type, payload);
-                    continue;
-                }
-
-                Fail("invalid Netplay packet magic");
-                break;
-            }
-
-            m_connected.store(false, std::memory_order_release);
-            m_running.store(false, std::memory_order_release);
-            m_remote_cv.notify_all();
-            m_boot_cv.notify_all();
-            m_first_poll_cv.notify_all();
-            if (!m_stop_requested.load(std::memory_order_acquire) && !m_failed.load(std::memory_order_acquire))
-            {
-                SetLastError("peer disconnected");
-                Log("peer disconnected");
-            }
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            if (!m_game_selected)
+                return false;
+            payload->fill(0);
+            WriteU32(payload->data(), m_game_crc);
+            std::snprintf(reinterpret_cast<char*>(payload->data() + 4), 32, "%s", m_game_serial.c_str());
+            std::snprintf(reinterpret_cast<char*>(payload->data() + 36), 160, "%s", m_game_title.c_str());
+            return true;
         }
 
-        void HandleControl(ControlType type, const std::vector<std::uint8_t>& payload)
+        bool BroadcastGameManifest()
         {
-            switch (type)
+            if (m_max_players == 1)
+                return true;
+            std::array<std::uint8_t, 4 + 32 + 160> payload{};
+            if (!BuildGameManifest(&payload))
+                return false;
+            BroadcastControl(ControlType::GameManifest, payload.data(), static_cast<std::uint32_t>(payload.size()));
+            return true;
+        }
+
+        bool SendGameManifestToPeer(Peer& peer)
+        {
+            std::array<std::uint8_t, 4 + 32 + 160> payload{};
+            if (!BuildGameManifest(&payload))
+                return false;
+            return SendControlToPeer(peer, ControlType::GameManifest, payload.data(), static_cast<std::uint32_t>(payload.size()));
+        }
+
+        void HandleRoster(const std::vector<std::uint8_t>& payload)
+        {
+            if (payload.size() != (4 + MAX_PLAYERS * 44))
+                return;
+            const std::uint32_t max_players = ReadU32(payload.data());
+            if (max_players < 1 || max_players > MAX_PLAYERS)
+                return;
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            m_max_players = max_players;
+            for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
             {
-                case ControlType::GameManifest:
-                    HandleGameManifest(payload);
-                    break;
-                case ControlType::GameMatch:
-                    HandleGameMatch(payload);
-                    break;
-                case ControlType::PrepareBoot:
-                    HandlePrepareBoot();
-                    break;
-                case ControlType::BootReady:
-                {
-                    {
-                        std::lock_guard<std::mutex> lock(m_state_mutex);
-                        m_peer_boot_ready = true;
-                    }
-                    Log("BOOT_READY received from peer");
-                    MaybeCommitStart();
-                    m_boot_cv.notify_all();
-                    break;
-                }
-                case ControlType::StartCommit:
-                {
-                    {
-                        std::lock_guard<std::mutex> lock(m_state_mutex);
-                        m_start_committed = true;
-                    }
-                    Log("START_COMMIT received from host");
-                    m_boot_cv.notify_all();
-                    break;
-                }
-                case ControlType::FirstPollReady:
-                {
-                    {
-                        std::lock_guard<std::mutex> lock(m_state_mutex);
-                        m_peer_first_poll_ready = true;
-                    }
-                    Log("FIRST_POLL_READY received from peer");
-                    MaybeReleaseFirstPoll();
-                    m_first_poll_cv.notify_all();
-                    break;
-                }
-                case ControlType::FirstPollGo:
-                {
-                    {
-                        std::lock_guard<std::mutex> lock(m_state_mutex);
-                        m_first_poll_go = true;
-                    }
-                    Log("FIRST_POLL_GO received from host");
-                    m_first_poll_cv.notify_all();
-                    break;
-                }
-                default:
-                    Fail("unknown Netplay control message");
-                    break;
+                const std::uint8_t* row = payload.data() + 4 + i * 44;
+                const std::uint32_t id = ReadU32(row);
+                if (id != i + 1)
+                    continue;
+                const std::uint32_t flags = ReadU32(row + 4);
+                m_players[i].connected = (flags & 1u) != 0;
+                m_players[i].game_match = (flags & 2u) != 0;
+                m_players[i].memcard_ready = (flags & 4u) != 0;
+                m_players[i].boot_ready = (flags & 8u) != 0;
+                const char* name = reinterpret_cast<const char*>(row + 8);
+                std::size_t len = 0;
+                while (len < 36 && name[len] != '\0')
+                    ++len;
+                m_players[i].name.assign(name, len);
             }
         }
 
         void HandleGameManifest(const std::vector<std::uint8_t>& payload)
         {
             if (m_role != Role::Client || payload.size() != (4 + 32 + 160))
-            {
-                Fail("invalid GAME_MANIFEST");
                 return;
-            }
-
             const std::uint32_t crc = ReadU32(payload.data());
             const char* serial_ptr = reinterpret_cast<const char*>(payload.data() + 4);
             const char* title_ptr = reinterpret_cast<const char*>(payload.data() + 36);
@@ -1011,7 +1165,6 @@ namespace
                 if (entry)
                     local_path = entry->path;
             }
-
             const bool matched = !local_path.empty();
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
@@ -1021,80 +1174,344 @@ namespace
                 m_game_crc = crc;
                 m_local_game_path = local_path;
                 m_local_game_match = matched;
-                m_peer_game_match = true;
-                ResetBootStateLocked();
+                ResetStartStateLocked();
+                if (m_local_player_id >= 1 && m_local_player_id <= MAX_PLAYERS)
+                    m_players[m_local_player_id - 1].game_match = matched;
+                m_players[0].game_match = true;
             }
-
-            std::array<std::uint8_t, 4> match_payload{};
-            WriteU32(match_payload.data(), matched ? 1u : 0u);
-            Log("GAME_MANIFEST received: title=%s serial=%s crc=%08X local_match=%s",
+            std::array<std::uint8_t, 8> reply{};
+            WriteU32(reply.data(), m_local_player_id);
+            WriteU32(reply.data() + 4, matched ? 1u : 0u);
+            SendControlToHost(ControlType::GameMatch, reply.data(), static_cast<std::uint32_t>(reply.size()));
+            Log("GAME_MANIFEST: title=%s serial=%s crc=%08X local_match=%s",
                 title.c_str(), serial.c_str(), crc, matched ? "yes" : "no");
-            if (!SendControl(ControlType::GameMatch, match_payload.data(), static_cast<std::uint32_t>(match_payload.size())))
-                Fail("failed to send GAME_MATCH");
         }
 
-        void HandleGameMatch(const std::vector<std::uint8_t>& payload)
+        bool ExportConfiguredMemoryCard(std::vector<std::uint8_t>* data, bool* present, std::string* error)
         {
-            if (m_role != Role::Host || payload.size() != 4)
-            {
-                Fail("invalid GAME_MATCH");
-                return;
-            }
+            data->clear();
+            *present = false;
+            const Pcsx2Config::McdOptions config = EmuConfig.Mcd[0];
+            if (!config.Enabled || config.Type == MemoryCardType::Empty)
+                return true;
 
-            const bool matched = ReadU32(payload.data()) != 0;
+            const std::string path = EmuConfig.FullpathToMcd(0);
+            if (config.Type == MemoryCardType::File)
             {
-                std::lock_guard<std::mutex> lock(m_state_mutex);
-                m_peer_game_match = matched;
-            }
-            Log("GAME_MATCH received from client: %s", matched ? "OK" : "MISMATCH");
-        }
-
-        void HandlePrepareBoot()
-        {
-            if (m_role != Role::Client)
-            {
-                Fail("client-only PREPARE_BOOT received by host");
-                return;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (!m_game_selected || !m_local_game_match || m_local_game_path.empty())
+                std::ifstream file(path, std::ios::binary | std::ios::ate);
+                if (!file)
                 {
-                    m_last_error = "PREPARE_BOOT received but local game does not match host";
-                    return;
+                    *error = "无法读取房主记忆卡文件";
+                    return false;
                 }
-                ResetBootStateLocked();
+                const std::streamsize size = file.tellg();
+                if (size <= 0 || size > (80ll * 1024ll * 1024ll))
+                {
+                    *error = "房主记忆卡大小异常";
+                    return false;
+                }
+                data->resize(static_cast<std::size_t>(size));
+                file.seekg(0, std::ios::beg);
+                if (!file.read(reinterpret_cast<char*>(data->data()), size))
+                {
+                    *error = "读取房主记忆卡失败";
+                    return false;
+                }
+                *present = true;
+                return true;
+            }
+
+            if (config.Type == MemoryCardType::Folder)
+            {
+                FolderMemoryCard card;
+                card.Open(path, config, 0, false, "");
+                if (card.IsPresent() <= 0)
+                {
+                    card.Close(false);
+                    *error = "无法打开房主文件夹记忆卡";
+                    return false;
+                }
+                const std::size_t capacity = static_cast<std::size_t>(card.GetSizeInClusters()) * FolderMemoryCard::ClusterSizeRaw;
+                if (capacity == 0 || capacity > (80u * 1024u * 1024u))
+                {
+                    card.Close(false);
+                    *error = "房主文件夹记忆卡大小异常";
+                    return false;
+                }
+                data->resize(capacity);
+                std::size_t address = 0;
+                while (address < capacity)
+                {
+                    const int size = static_cast<int>(std::min<std::size_t>(FolderMemoryCard::PageSizeRaw, capacity - address));
+                    if (card.Read(data->data() + address, static_cast<u32>(address), size) < 0)
+                    {
+                        card.Close(false);
+                        *error = "导出房主文件夹记忆卡失败";
+                        return false;
+                    }
+                    address += static_cast<std::size_t>(size);
+                }
+                card.Close(false);
+                *present = true;
+                return true;
+            }
+
+            *error = "当前记忆卡类型暂不支持联机同步";
+            return false;
+        }
+
+        bool WriteShadowCard(const std::vector<std::uint8_t>& data, bool present, std::string* out_filename)
+        {
+            if (!present)
+            {
+                out_filename->clear();
+                return true;
+            }
+            std::error_code ec;
+            std::filesystem::create_directories(EmuFolders::MemoryCards, ec);
+            char name[96]{};
+            std::snprintf(name, sizeof(name), "NetplayShadow-%016llX.ps2", static_cast<unsigned long long>(m_session_id));
+            const std::filesystem::path path = std::filesystem::path(EmuFolders::MemoryCards) / name;
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            if (!file)
+                return false;
+            file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+            if (!file)
+                return false;
+            *out_filename = name;
+            return true;
+        }
+
+        void StartHostMemoryCardSync()
+        {
+            std::vector<std::uint8_t> data;
+            bool present = false;
+            std::string error;
+            if (!ExportConfiguredMemoryCard(&data, &present, &error))
+            {
+                Fail(error.c_str());
+                return;
+            }
+
+            const std::uint64_t hash = present ? HashBytes(data) : 0;
+            std::string shadow;
+            if (!WriteShadowCard(data, present, &shadow))
+            {
+                Fail("无法创建房主联机临时记忆卡");
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                m_memory_card_present = present;
+                m_memory_card_crc = hash;
+                m_memory_card_size = static_cast<std::uint32_t>(data.size());
+                m_shadow_card_filename = shadow;
+                m_memory_card_local_ready = true;
+                m_players[0].memcard_ready = true;
+                m_memory_card_status = present ? "房主临时记忆卡已创建，正在同步给其他玩家" : "房主未插入记忆卡，已同步为无卡状态";
+            }
+
+            std::array<std::uint8_t, 16> begin{};
+            WriteU32(begin.data(), present ? 1u : 0u);
+            WriteU32(begin.data() + 4, static_cast<std::uint32_t>(data.size()));
+            WriteU64(begin.data() + 8, hash);
+            BroadcastControl(ControlType::MemcardBegin, begin.data(), static_cast<std::uint32_t>(begin.size()));
+
+            for (std::uint32_t offset = 0; offset < data.size(); offset += MEMCARD_CHUNK)
+            {
+                const std::uint32_t chunk_size = std::min<std::uint32_t>(MEMCARD_CHUNK,
+                    static_cast<std::uint32_t>(data.size()) - offset);
+                std::vector<std::uint8_t> chunk(4u + chunk_size);
+                WriteU32(chunk.data(), offset);
+                std::memcpy(chunk.data() + 4, data.data() + offset, chunk_size);
+                BroadcastControl(ControlType::MemcardChunk, chunk.data(), static_cast<std::uint32_t>(chunk.size()));
+            }
+            BroadcastControl(ControlType::MemcardEnd, nullptr, 0);
+            BroadcastRoster();
+            Log("memory card shadow prepared: present=%s size=%u hash=%016llX",
+                present ? "yes" : "no", static_cast<unsigned>(data.size()), static_cast<unsigned long long>(hash));
+            MaybeAdvanceStart();
+        }
+
+        void HandleClientMemcardBegin(const std::vector<std::uint8_t>& payload)
+        {
+            if (payload.size() != 16)
+                return;
+            const bool present = ReadU32(payload.data()) != 0;
+            const std::uint32_t size = ReadU32(payload.data() + 4);
+            const std::uint64_t hash = ReadU64(payload.data() + 8);
+            if (size > 80u * 1024u * 1024u)
+            {
+                Fail("memory card transfer is too large");
+                return;
+            }
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            m_memory_card_present = present;
+            m_memory_card_crc = hash;
+            m_memory_card_size = size;
+            m_memcard_receive.assign(size, 0);
+            m_memcard_received_bytes = 0;
+            m_memory_card_local_ready = false;
+            m_memory_card_status = present ? "正在接收房主记忆卡临时副本" : "房主未插入记忆卡";
+        }
+
+        void HandleClientMemcardChunk(const std::vector<std::uint8_t>& payload)
+        {
+            if (payload.size() < 4)
+                return;
+            const std::uint32_t offset = ReadU32(payload.data());
+            const std::uint32_t size = static_cast<std::uint32_t>(payload.size() - 4);
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            if (offset > m_memcard_receive.size() || size > (m_memcard_receive.size() - offset))
+            {
+                m_last_error = "记忆卡数据块越界";
+                return;
+            }
+            if (size > 0)
+                std::memcpy(m_memcard_receive.data() + offset, payload.data() + 4, size);
+            m_memcard_received_bytes += size;
+        }
+
+        void HandleClientMemcardEnd()
+        {
+            std::vector<std::uint8_t> data;
+            bool present = false;
+            std::uint64_t expected = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                data = m_memcard_receive;
+                present = m_memory_card_present;
+                expected = m_memory_card_crc;
+            }
+            const std::uint64_t actual = present ? HashBytes(data) : 0;
+            bool ok = (actual == expected);
+            std::string shadow;
+            if (ok)
+                ok = WriteShadowCard(data, present, &shadow);
+
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                m_memory_card_local_ready = ok;
+                m_shadow_card_filename = ok ? shadow : std::string();
+                if (m_local_player_id >= 1 && m_local_player_id <= MAX_PLAYERS)
+                    m_players[m_local_player_id - 1].memcard_ready = ok;
+                m_memory_card_status = ok ? (present ? "记忆卡同步完成 ✓（使用联机临时副本）" : "无记忆卡状态同步完成 ✓") : "记忆卡同步失败";
+                m_memcard_receive.clear();
+            }
+
+            std::array<std::uint8_t, 12> reply{};
+            WriteU32(reply.data(), ok ? 1u : 0u);
+            WriteU64(reply.data() + 4, actual);
+            SendControlToHost(ControlType::MemcardReady, reply.data(), static_cast<std::uint32_t>(reply.size()));
+            Log("memory card receive complete: ok=%s size=%u hash=%016llX", ok ? "yes" : "no",
+                static_cast<unsigned>(data.size()), static_cast<unsigned long long>(actual));
+            if (!ok)
+                Fail("memory card synchronization failed");
+        }
+
+        void MaybeAdvanceStart()
+        {
+            if (m_role != Role::Host)
+                return;
+
+            bool start_memcard = false;
+            bool begin_boot = false;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (!m_start_requested || m_prepare_boot || ConnectedCountLocked() != m_max_players || !AllGamesMatchLocked())
+                    return;
+
+                if (m_memory_card_sync_enabled)
+                {
+                    if (!m_memcard_transfer_started)
+                    {
+                        m_memcard_transfer_started = true;
+                        start_memcard = true;
+                    }
+                    else if (AllMemcardsReadyLocked())
+                    {
+                        begin_boot = true;
+                    }
+                }
+                else
+                {
+                    m_memory_card_local_ready = true;
+                    for (std::uint32_t i = 0; i < m_max_players; i++)
+                        m_players[i].memcard_ready = true;
+                    m_memory_card_status = "记忆卡同步已关闭";
+                    begin_boot = true;
+                }
+            }
+
+            if (start_memcard)
+            {
+                StartHostMemoryCardSync();
+                return;
+            }
+            if (!begin_boot)
+                return;
+
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (m_prepare_boot)
+                    return;
                 m_prepare_boot = true;
                 m_boot_launch_pending = true;
+                m_boot_launch_consumed = false;
+                m_local_boot_ready = false;
+                for (std::uint32_t i = 0; i < m_max_players; i++)
+                {
+                    m_players[i].boot_ready = false;
+                    m_players[i].first_poll_ready = false;
+                }
             }
-            Log("PREPARE_BOOT received; local matching game queued for synchronized launch");
+            Log("all players matched and memory cards ready; PREPARE_BOOT");
+            BroadcastControl(ControlType::PrepareBoot, nullptr, 0);
+            BroadcastRoster();
+        }
+
+        void HandleClientPrepareBoot()
+        {
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            if (!m_game_selected || !m_local_game_match || m_local_game_path.empty() ||
+                (m_memory_card_sync_enabled && !m_memory_card_local_ready))
+            {
+                m_last_error = "收到启动命令，但本机游戏或记忆卡尚未准备完成";
+                return;
+            }
+            m_prepare_boot = true;
+            m_boot_launch_pending = true;
+            m_boot_launch_consumed = false;
+            m_local_boot_ready = false;
+            m_start_requested = true;
+            m_start_committed = false;
+            m_first_poll_go = false;
+            for (auto& player : m_players)
+            {
+                player.boot_ready = false;
+                player.first_poll_ready = false;
+            }
+            Log("PREPARE_BOOT received; local matching game queued");
         }
 
         void MaybeCommitStart()
         {
             if (m_role != Role::Host)
                 return;
-
             bool commit = false;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (m_prepare_boot && m_local_boot_ready && m_peer_boot_ready && !m_start_committed)
+                if (AllBootReadyLocked() && !m_start_committed)
                 {
                     m_start_committed = true;
                     commit = true;
                 }
             }
-
             if (!commit)
                 return;
-
-            Log("both VMs BOOT_READY; sending START_COMMIT");
-            if (!SendControl(ControlType::StartCommit, nullptr, 0))
-            {
-                Fail("failed to send START_COMMIT");
-                return;
-            }
+            Log("all VMs BOOT_READY; START_COMMIT");
+            BroadcastControl(ControlType::StartCommit, nullptr, 0);
             m_boot_cv.notify_all();
         }
 
@@ -1102,66 +1519,462 @@ namespace
         {
             if (m_role != Role::Host)
                 return;
-
             bool release = false;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (m_prepare_boot && m_start_committed && m_local_first_poll_ready &&
-                    m_peer_first_poll_ready && !m_first_poll_go)
+                if (m_start_committed && AllFirstPollReadyLocked() && !m_first_poll_go)
                 {
                     m_first_poll_go = true;
                     release = true;
                 }
             }
-
             if (!release)
                 return;
-
-            Log("both peers reached first DS2 poll; sending FIRST_POLL_GO");
-            if (!SendControl(ControlType::FirstPollGo, nullptr, 0))
-            {
-                Fail("failed to send FIRST_POLL_GO");
-                return;
-            }
+            Log("all players reached first DS2 poll; FIRST_POLL_GO");
+            BroadcastControl(ControlType::FirstPollGo, nullptr, 0);
             m_first_poll_cv.notify_all();
         }
 
-        bool WaitForRemoteFrame(std::uint32_t frame, InputFrame* output)
+        bool WaitForFirstPollBarrier()
+        {
+            bool send_ready = false;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (!m_prepare_boot || m_first_poll_go)
+                    return true;
+                PlayerState& local = m_players[m_local_player_id - 1];
+                if (!local.first_poll_ready)
+                {
+                    local.first_poll_ready = true;
+                    send_ready = (m_role == Role::Client);
+                }
+            }
+
+            if (send_ready && !SendControlToHost(ControlType::FirstPollReady, nullptr, 0))
+            {
+                Fail("failed to send FIRST_POLL_READY");
+                return false;
+            }
+            if (m_role == Role::Host)
+                MaybeReleaseFirstPoll();
+
+            std::unique_lock<std::mutex> lock(m_state_mutex);
+            const bool released = m_first_poll_cv.wait_for(lock, std::chrono::seconds(BOOT_BARRIER_TIMEOUT_SECONDS), [this]() {
+                return m_first_poll_go || m_failed.load(std::memory_order_acquire) ||
+                    m_stop_requested.load(std::memory_order_acquire);
+            });
+            if (!released || !m_first_poll_go)
+            {
+                lock.unlock();
+                Fail("timed out waiting for FIRST_POLL_GO");
+                return false;
+            }
+            return true;
+        }
+
+        bool SendInputToHost(std::uint32_t frame, const InputFrame& input)
+        {
+            std::array<std::uint8_t, 18> packet{};
+            WriteU32(packet.data(), INPUT_MAGIC);
+            WriteU32(packet.data() + 4, frame);
+            WriteU32(packet.data() + 8, m_local_player_id);
+            std::memcpy(packet.data() + 12, input.data(), input.size());
+            std::lock_guard<std::mutex> socket_lock(m_client_socket_mutex);
+            return m_client_socket != INVALID_SOCKET &&
+                SendPacketLocked(m_client_socket, m_client_send_mutex, packet.data(), packet.size());
+        }
+
+        void BroadcastBundle(std::uint32_t frame, const InputBundle& bundle)
+        {
+            std::array<std::uint8_t, 36> packet{};
+            WriteU32(packet.data(), BUNDLE_MAGIC);
+            WriteU32(packet.data() + 4, frame);
+            WriteU32(packet.data() + 8, m_max_players);
+            for (std::size_t i = 0; i < MAX_PLAYERS; i++)
+                std::memcpy(packet.data() + 12 + i * 6, bundle[i].data(), 6);
+
+            std::lock_guard<std::mutex> lock(m_peer_mutex);
+            for (auto& peer : m_peers)
+            {
+                if (peer && peer->connected.load(std::memory_order_acquire))
+                    SendPacketLocked(peer->socket, peer->send_mutex, packet.data(), packet.size());
+            }
+        }
+
+        bool WaitForHostInputs(std::uint32_t frame, InputBundle* bundle)
         {
             const auto started = std::chrono::steady_clock::now();
-            std::unique_lock<std::mutex> lock(m_remote_mutex);
-            const bool ready = m_remote_cv.wait_for(lock, std::chrono::seconds(RECEIVE_TIMEOUT_SECONDS), [this, frame]() {
-                return m_remote_frames.find(frame) != m_remote_frames.end() ||
-                    !m_connected.load(std::memory_order_acquire) || m_stop_requested.load(std::memory_order_acquire);
+            std::unique_lock<std::mutex> lock(m_input_mutex);
+            const bool ready = m_input_cv.wait_for(lock, std::chrono::seconds(RECEIVE_TIMEOUT_SECONDS), [this, frame]() {
+                for (std::uint32_t i = 0; i < m_max_players; i++)
+                {
+                    if (m_player_inputs[i].find(frame) == m_player_inputs[i].end())
+                        return m_failed.load(std::memory_order_acquire) || m_stop_requested.load(std::memory_order_acquire);
+                }
+                return true;
             });
-            const auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - started).count();
+            LogStall(frame, waited);
+            if (!ready || m_failed.load(std::memory_order_acquire))
+                return false;
+            for (std::uint32_t i = 0; i < m_max_players; i++)
+            {
+                const auto it = m_player_inputs[i].find(frame);
+                if (it == m_player_inputs[i].end())
+                    return false;
+                (*bundle)[i] = it->second;
+            }
+            for (std::uint32_t i = m_max_players; i < MAX_PLAYERS; i++)
+                (*bundle)[i] = NEUTRAL_FRAME;
+            return true;
+        }
+
+        bool WaitForBundle(std::uint32_t frame, InputBundle* bundle)
+        {
+            const auto started = std::chrono::steady_clock::now();
+            std::unique_lock<std::mutex> lock(m_bundle_mutex);
+            const bool ready = m_bundle_cv.wait_for(lock, std::chrono::seconds(RECEIVE_TIMEOUT_SECONDS), [this, frame]() {
+                return m_bundles.find(frame) != m_bundles.end() || m_failed.load(std::memory_order_acquire) ||
+                    m_stop_requested.load(std::memory_order_acquire) || !m_connected.load(std::memory_order_acquire);
+            });
+            const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            LogStall(frame, waited);
+            if (!ready)
+                return false;
+            const auto it = m_bundles.find(frame);
+            if (it == m_bundles.end())
+                return false;
+            *bundle = it->second;
+            return true;
+        }
+
+        void LogStall(std::uint32_t frame, long long wait_ms)
+        {
             const std::uint32_t wait = static_cast<std::uint32_t>(std::max<long long>(0, wait_ms));
             m_last_wait_ms.store(wait, std::memory_order_release);
             if (wait >= 1000)
                 Log("STALL severe: poll=%u waited=%ums", static_cast<unsigned>(frame), static_cast<unsigned>(wait));
             else if (wait >= 250)
                 Log("STALL: poll=%u waited=%ums", static_cast<unsigned>(frame), static_cast<unsigned>(wait));
-            if (!ready)
+        }
+
+        bool BeginPadPoll()
+        {
+            if (!m_start_committed || !m_connected.load(std::memory_order_acquire))
+                return false;
+            if (!WaitForFirstPollBarrier())
                 return false;
 
-            const auto it = m_remote_frames.find(frame);
-            if (it == m_remote_frames.end())
-                return false;
-            *output = it->second;
+            if (m_have_capture)
+            {
+                if (m_role == Role::Host)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(m_input_mutex);
+                        m_player_inputs[0][m_frame] = m_capture;
+                    }
+                    m_input_cv.notify_all();
+                }
+                else if (!SendInputToHost(m_frame, m_capture))
+                {
+                    Fail("failed to send local controller input");
+                    return false;
+                }
+                ++m_frame;
+            }
+            else
+            {
+                m_have_capture = true;
+            }
+
+            m_capture = NEUTRAL_FRAME;
+            m_output_bundle.fill(NEUTRAL_FRAME);
+            const std::uint32_t delay = m_delay.load(std::memory_order_acquire);
+            if (m_frame >= delay)
+            {
+                const std::uint32_t source_frame = m_frame - delay;
+                InputBundle bundle{};
+                bundle.fill(NEUTRAL_FRAME);
+                if (m_role == Role::Host)
+                {
+                    if (!WaitForHostInputs(source_frame, &bundle))
+                    {
+                        Fail("timed out waiting for room controller inputs");
+                        return false;
+                    }
+                    BroadcastBundle(source_frame, bundle);
+                }
+                else if (!WaitForBundle(source_frame, &bundle))
+                {
+                    Fail("timed out waiting for authoritative input bundle");
+                    return false;
+                }
+                m_output_bundle = bundle;
+                if ((source_frame % LOG_FRAME_INTERVAL) == 0)
+                    Log("SYNC poll=%u vsync=%llu delay=%u players=%u wait_ms=%u",
+                        static_cast<unsigned>(source_frame), static_cast<unsigned long long>(g_FrameCount),
+                        static_cast<unsigned>(delay), static_cast<unsigned>(m_max_players),
+                        static_cast<unsigned>(m_last_wait_ms.load(std::memory_order_acquire)));
+            }
+            PruneInputHistory();
             return true;
         }
 
-        void PruneFrames()
+        void PruneInputHistory()
         {
             if (m_frame < 180)
                 return;
             const std::uint32_t keep_from = m_frame - 120;
-            for (auto it = m_local_frames.begin(); it != m_local_frames.end();)
-                it = (it->first < keep_from) ? m_local_frames.erase(it) : std::next(it);
-            std::lock_guard<std::mutex> lock(m_remote_mutex);
-            for (auto it = m_remote_frames.begin(); it != m_remote_frames.end();)
-                it = (it->first < keep_from) ? m_remote_frames.erase(it) : std::next(it);
+            {
+                std::lock_guard<std::mutex> lock(m_input_mutex);
+                for (auto& map : m_player_inputs)
+                {
+                    for (auto it = map.begin(); it != map.end();)
+                        it = (it->first < keep_from) ? map.erase(it) : std::next(it);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_bundle_mutex);
+                for (auto it = m_bundles.begin(); it != m_bundles.end();)
+                    it = (it->first < keep_from) ? m_bundles.erase(it) : std::next(it);
+            }
+        }
+
+        void HostPeerReceiver(Peer* peer)
+        {
+            while (!m_stop_requested.load(std::memory_order_acquire) && peer->connected.load(std::memory_order_acquire))
+            {
+                std::array<std::uint8_t, 4> magic_bytes{};
+                if (!ReceiveAll(peer->socket, magic_bytes.data(), magic_bytes.size()))
+                    break;
+                const std::uint32_t magic = ReadU32(magic_bytes.data());
+                if (magic == INPUT_MAGIC)
+                {
+                    std::array<std::uint8_t, 14> rest{};
+                    if (!ReceiveAll(peer->socket, rest.data(), rest.size()))
+                        break;
+                    const std::uint32_t frame = ReadU32(rest.data());
+                    const std::uint32_t player_id = ReadU32(rest.data() + 4);
+                    if (player_id != peer->player_id)
+                    {
+                        Fail("controller input player id mismatch");
+                        break;
+                    }
+                    InputFrame input{};
+                    std::memcpy(input.data(), rest.data() + 8, input.size());
+                    {
+                        std::lock_guard<std::mutex> lock(m_input_mutex);
+                        m_player_inputs[player_id - 1][frame] = input;
+                    }
+                    m_input_cv.notify_all();
+                    continue;
+                }
+                if (magic == CONTROL_MAGIC)
+                {
+                    std::array<std::uint8_t, 8> rest{};
+                    if (!ReceiveAll(peer->socket, rest.data(), rest.size()))
+                        break;
+                    const ControlType type = static_cast<ControlType>(ReadU32(rest.data()));
+                    const std::uint32_t size = ReadU32(rest.data() + 4);
+                    if (size > MAX_CONTROL_PAYLOAD)
+                    {
+                        Fail("invalid control payload size");
+                        break;
+                    }
+                    std::vector<std::uint8_t> payload(size);
+                    if (size > 0 && !ReceiveAll(peer->socket, payload.data(), payload.size()))
+                        break;
+                    HandleHostControl(*peer, type, payload);
+                    continue;
+                }
+                Fail("invalid packet from client");
+                break;
+            }
+
+            peer->connected.store(false, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (peer->player_id >= 1 && peer->player_id <= MAX_PLAYERS)
+                    m_players[peer->player_id - 1].connected = false;
+            }
+            Log("P%u disconnected", static_cast<unsigned>(peer->player_id));
+            BroadcastRoster();
+            if (m_start_requested || m_prepare_boot || m_start_committed)
+                Fail("player disconnected during synchronized session");
+        }
+
+        void ClientReceiverLoop(SOCKET socket)
+        {
+            while (!m_stop_requested.load(std::memory_order_acquire))
+            {
+                std::array<std::uint8_t, 4> magic_bytes{};
+                if (!ReceiveAll(socket, magic_bytes.data(), magic_bytes.size()))
+                    break;
+                const std::uint32_t magic = ReadU32(magic_bytes.data());
+                if (magic == BUNDLE_MAGIC)
+                {
+                    std::array<std::uint8_t, 32> rest{};
+                    if (!ReceiveAll(socket, rest.data(), rest.size()))
+                        break;
+                    const std::uint32_t frame = ReadU32(rest.data());
+                    const std::uint32_t count = ReadU32(rest.data() + 4);
+                    if (count < 1 || count > MAX_PLAYERS)
+                    {
+                        Fail("invalid authoritative input bundle");
+                        break;
+                    }
+                    InputBundle bundle{};
+                    bundle.fill(NEUTRAL_FRAME);
+                    for (std::size_t i = 0; i < MAX_PLAYERS; i++)
+                        std::memcpy(bundle[i].data(), rest.data() + 8 + i * 6, 6);
+                    {
+                        std::lock_guard<std::mutex> lock(m_bundle_mutex);
+                        m_bundles[frame] = bundle;
+                    }
+                    m_bundle_cv.notify_all();
+                    continue;
+                }
+                if (magic == CONTROL_MAGIC)
+                {
+                    std::array<std::uint8_t, 8> rest{};
+                    if (!ReceiveAll(socket, rest.data(), rest.size()))
+                        break;
+                    const ControlType type = static_cast<ControlType>(ReadU32(rest.data()));
+                    const std::uint32_t size = ReadU32(rest.data() + 4);
+                    if (size > MAX_CONTROL_PAYLOAD)
+                    {
+                        Fail("invalid control payload size");
+                        break;
+                    }
+                    std::vector<std::uint8_t> payload(size);
+                    if (size > 0 && !ReceiveAll(socket, payload.data(), payload.size()))
+                        break;
+                    HandleClientControl(type, payload);
+                    continue;
+                }
+                Fail("invalid packet from host");
+                break;
+            }
+            m_connected.store(false, std::memory_order_release);
+            m_running.store(false, std::memory_order_release);
+            m_input_cv.notify_all();
+            m_bundle_cv.notify_all();
+            m_boot_cv.notify_all();
+            m_first_poll_cv.notify_all();
+            if (!m_stop_requested.load(std::memory_order_acquire) && !m_failed.load(std::memory_order_acquire))
+                Fail("host disconnected");
+        }
+
+        void HandleHostControl(Peer& peer, ControlType type, const std::vector<std::uint8_t>& payload)
+        {
+            switch (type)
+            {
+                case ControlType::GameMatch:
+                {
+                    if (payload.size() != 8)
+                        return;
+                    const std::uint32_t id = ReadU32(payload.data());
+                    const bool matched = ReadU32(payload.data() + 4) != 0;
+                    if (id != peer.player_id)
+                        return;
+                    {
+                        std::lock_guard<std::mutex> lock(m_state_mutex);
+                        m_players[id - 1].game_match = matched;
+                    }
+                    Log("P%u GAME_MATCH=%s", static_cast<unsigned>(id), matched ? "yes" : "no");
+                    BroadcastRoster();
+                    MaybeAdvanceStart();
+                    break;
+                }
+                case ControlType::MemcardReady:
+                {
+                    if (payload.size() != 12)
+                        return;
+                    const bool ok = ReadU32(payload.data()) != 0;
+                    const std::uint64_t hash = ReadU64(payload.data() + 4);
+                    {
+                        std::lock_guard<std::mutex> lock(m_state_mutex);
+                        m_players[peer.player_id - 1].memcard_ready = ok && (hash == m_memory_card_crc);
+                    }
+                    Log("P%u MEMCARD_READY=%s hash=%016llX", static_cast<unsigned>(peer.player_id),
+                        ok ? "yes" : "no", static_cast<unsigned long long>(hash));
+                    BroadcastRoster();
+                    MaybeAdvanceStart();
+                    break;
+                }
+                case ControlType::BootReady:
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(m_state_mutex);
+                        m_players[peer.player_id - 1].boot_ready = true;
+                    }
+                    Log("P%u BOOT_READY", static_cast<unsigned>(peer.player_id));
+                    BroadcastRoster();
+                    MaybeCommitStart();
+                    break;
+                }
+                case ControlType::FirstPollReady:
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(m_state_mutex);
+                        m_players[peer.player_id - 1].first_poll_ready = true;
+                    }
+                    Log("P%u FIRST_POLL_READY", static_cast<unsigned>(peer.player_id));
+                    MaybeReleaseFirstPoll();
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+
+        void HandleClientControl(ControlType type, const std::vector<std::uint8_t>& payload)
+        {
+            switch (type)
+            {
+                case ControlType::Roster:
+                    HandleRoster(payload);
+                    break;
+                case ControlType::GameManifest:
+                    HandleGameManifest(payload);
+                    break;
+                case ControlType::MemcardBegin:
+                    HandleClientMemcardBegin(payload);
+                    break;
+                case ControlType::MemcardChunk:
+                    HandleClientMemcardChunk(payload);
+                    break;
+                case ControlType::MemcardEnd:
+                    HandleClientMemcardEnd();
+                    break;
+                case ControlType::PrepareBoot:
+                    HandleClientPrepareBoot();
+                    break;
+                case ControlType::StartCommit:
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(m_state_mutex);
+                        m_start_committed = true;
+                    }
+                    Log("START_COMMIT received");
+                    m_boot_cv.notify_all();
+                    break;
+                }
+                case ControlType::FirstPollGo:
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(m_state_mutex);
+                        m_first_poll_go = true;
+                    }
+                    Log("FIRST_POLL_GO received");
+                    m_first_poll_cv.notify_all();
+                    break;
+                }
+                default:
+                    break;
+            }
         }
 
         void Fail(const char* message)
@@ -1170,29 +1983,61 @@ namespace
             if (!m_failed.exchange(true, std::memory_order_acq_rel))
                 Log("ERROR: %s (WSA=%d)", message, WSAGetLastError());
             m_connected.store(false, std::memory_order_release);
-            m_running.store(false, std::memory_order_release);
             m_connecting.store(false, std::memory_order_release);
-            m_remote_cv.notify_all();
+            m_running.store(false, std::memory_order_release);
+            m_input_cv.notify_all();
+            m_bundle_cv.notify_all();
             m_boot_cv.notify_all();
             m_first_poll_cv.notify_all();
         }
 
         Role m_role = Role::Disabled;
+        std::string m_username;
         std::string m_host = "127.0.0.1";
         std::uint16_t m_port = DEFAULT_PORT;
+        std::uint32_t m_max_players = 2;
+        std::uint32_t m_local_player_id = 0;
+        std::uint64_t m_session_id = 0;
         std::atomic<std::uint32_t> m_delay{2};
+        bool m_memory_card_sync_enabled = true;
+
+        std::array<PlayerState, MAX_PLAYERS> m_players{};
+        bool m_game_selected = false;
+        bool m_local_game_match = false;
+        std::string m_game_title;
+        std::string m_game_serial;
+        std::uint32_t m_game_crc = 0;
+        std::string m_local_game_path;
+
+        bool m_start_requested = false;
+        bool m_memcard_transfer_started = false;
+        bool m_memory_card_local_ready = false;
+        bool m_memory_card_present = false;
+        std::uint64_t m_memory_card_crc = 0;
+        std::uint32_t m_memory_card_size = 0;
+        std::string m_memory_card_status = "等待记忆卡同步";
+        std::string m_shadow_card_filename;
+        std::vector<std::uint8_t> m_memcard_receive;
+        std::uint64_t m_memcard_received_bytes = 0;
+
+        bool m_prepare_boot = false;
+        bool m_boot_launch_pending = false;
+        bool m_boot_launch_consumed = false;
+        bool m_local_boot_ready = false;
+        bool m_start_committed = false;
+        bool m_first_poll_go = false;
 
         std::uint32_t m_frame = 0;
         bool m_have_capture = false;
-        bool m_winsock_started = false;
         InputFrame m_capture = NEUTRAL_FRAME;
-        InputFrame m_local_output = NEUTRAL_FRAME;
-        InputFrame m_remote_output = NEUTRAL_FRAME;
-        std::unordered_map<std::uint32_t, InputFrame> m_local_frames;
-        std::unordered_map<std::uint32_t, InputFrame> m_remote_frames;
+        InputBundle m_output_bundle = {NEUTRAL_FRAME, NEUTRAL_FRAME, NEUTRAL_FRAME, NEUTRAL_FRAME};
+        std::array<std::unordered_map<std::uint32_t, InputFrame>, MAX_PLAYERS> m_player_inputs;
+        std::unordered_map<std::uint32_t, InputBundle> m_bundles;
 
-        SOCKET m_socket = INVALID_SOCKET;
+        bool m_winsock_started = false;
         std::atomic<SOCKET> m_listener{INVALID_SOCKET};
+        SOCKET m_client_socket = INVALID_SOCKET;
+        std::array<std::unique_ptr<Peer>, 3> m_peers{};
         std::atomic<bool> m_connected{false};
         std::atomic<bool> m_connecting{false};
         std::atomic<bool> m_running{false};
@@ -1200,38 +2045,20 @@ namespace
         std::atomic<bool> m_stop_requested{false};
         std::atomic<bool> m_connect_worker_started{false};
         std::atomic<std::uint32_t> m_last_wait_ms{0};
-
-        std::mutex m_connect_mutex;
-        std::mutex m_socket_mutex;
-        std::mutex m_remote_mutex;
-        std::condition_variable m_remote_cv;
         std::thread m_connector;
-        std::thread m_receiver;
 
         mutable std::mutex m_state_mutex;
+        std::mutex m_peer_mutex;
+        std::mutex m_client_socket_mutex;
+        std::mutex m_client_send_mutex;
+        std::mutex m_input_mutex;
+        std::mutex m_bundle_mutex;
+        std::condition_variable m_input_cv;
+        std::condition_variable m_bundle_cv;
         std::condition_variable m_boot_cv;
         std::condition_variable m_first_poll_cv;
-        std::string m_peer;
         std::string m_last_error;
         std::string m_log_path;
-
-        bool m_game_selected = false;
-        bool m_local_game_match = false;
-        bool m_peer_game_match = false;
-        std::string m_game_title;
-        std::string m_game_serial;
-        std::uint32_t m_game_crc = 0;
-        std::string m_local_game_path;
-
-        bool m_prepare_boot = false;
-        bool m_boot_launch_pending = false;
-        bool m_boot_launch_consumed = false;
-        bool m_local_boot_ready = false;
-        bool m_peer_boot_ready = false;
-        bool m_start_committed = false;
-        bool m_local_first_poll_ready = false;
-        bool m_peer_first_poll_ready = false;
-        bool m_first_poll_go = false;
 
         mutable std::mutex m_log_mutex;
         mutable FILE* m_log_file = nullptr;
@@ -1245,72 +2072,27 @@ namespace
     }
 } // namespace
 
-bool IsConfigured()
-{
-    return GetSession().IsConfigured();
-}
-
-void StartSessionAsync()
-{
-    GetSession().StartSessionAsync();
-}
-
-StatusSnapshot GetStatusSnapshot()
-{
-    return GetSession().GetStatusSnapshot();
-}
-
+bool IsConfigured() { return GetSession().IsConfigured(); }
+void StartSessionAsync() { GetSession().StartSessionAsync(); }
+StatusSnapshot GetStatusSnapshot() { return GetSession().GetStatusSnapshot(); }
 bool HostSelectGame(const std::string& path, const std::string& title, const std::string& serial, std::uint32_t crc)
 {
     return GetSession().HostSelectGame(path, title, serial, crc);
 }
-
-bool RequestSynchronizedBoot()
+bool RequestSynchronizedBoot() { return GetSession().RequestSynchronizedBoot(); }
+bool ConsumeBootLaunchRequest(std::string* path) { return GetSession().ConsumeBootLaunchRequest(path); }
+bool CanStartVM() { return GetSession().CanStartVM(); }
+bool ShouldHoldBootBarrier() { return GetSession().ShouldHoldBootBarrier(); }
+void NotifyBootReady() { GetSession().NotifyBootReady(); }
+bool WaitForStartCommit() { return GetSession().WaitForStartCommit(); }
+void ApplyDeterministicConfig() { GetSession().ApplyDeterministicConfig(); }
+bool ShouldForceDualShock2Slot(std::uint32_t slot) { return GetSession().ShouldForceDualShock2Slot(slot); }
+bool ShouldDisconnectControllerSlot(std::uint32_t slot) { return GetSession().ShouldDisconnectControllerSlot(slot); }
+std::uint8_t HandlePadResponse(std::uint8_t slot, std::uint32_t index, std::uint8_t local_value)
 {
-    return GetSession().RequestSynchronizedBoot();
+    return GetSession().HandlePadResponse(slot, index, local_value);
 }
-
-bool ConsumeBootLaunchRequest(std::string* path)
-{
-    return GetSession().ConsumeBootLaunchRequest(path);
-}
-
-bool CanStartVM()
-{
-    return GetSession().CanStartVM();
-}
-
-bool ShouldHoldBootBarrier()
-{
-    return GetSession().ShouldHoldBootBarrier();
-}
-
-void NotifyBootReady()
-{
-    GetSession().NotifyBootReady();
-}
-
-bool WaitForStartCommit()
-{
-    return GetSession().WaitForStartCommit();
-}
-
-void ApplyDeterministicConfig()
-{
-    // v0.5a phase 1 focuses on synchronized selection/boot barriers. More
-    // deterministic settings and memory-card shadowing are layered on top only
-    // after this barrier is field-tested, to keep desync diagnosis attributable.
-}
-
-std::uint8_t HandlePadResponse(std::uint8_t unified_slot, std::uint32_t command_index, std::uint8_t local_value)
-{
-    return GetSession().HandlePadResponse(unified_slot, command_index, local_value);
-}
-
-void Shutdown()
-{
-    GetSession().Stop();
-}
+void Shutdown() { GetSession().Stop(); }
 #else
 bool IsConfigured() { return false; }
 void StartSessionAsync() {}
@@ -1323,6 +2105,8 @@ bool ShouldHoldBootBarrier() { return false; }
 void NotifyBootReady() {}
 bool WaitForStartCommit() { return true; }
 void ApplyDeterministicConfig() {}
+bool ShouldForceDualShock2Slot(std::uint32_t) { return false; }
+bool ShouldDisconnectControllerSlot(std::uint32_t) { return false; }
 std::uint8_t HandlePadResponse(std::uint8_t, std::uint32_t, std::uint8_t local_value) { return local_value; }
 void Shutdown() {}
 #endif

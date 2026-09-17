@@ -42,7 +42,7 @@ jobs:
           git rev-parse HEAD | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_SHA.txt
           git describe --tags --always | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_VERSION.txt
 
-      - name: Apply Modern Netplay v0.5a synchronized boot preview
+      - name: Apply Modern Netplay all-in-one multiplayer build
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path src\pcsx2\Netplay | Out-Null
@@ -101,41 +101,38 @@ jobs:
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.ps1 src\bin\Collect-Netplay-Diagnostics.ps1 -Force
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.bat src\bin\Collect-Netplay-Diagnostics.bat -Force
           @"
-          PCSX2 Modern Netplay v0.5a synchronized boot preview
-          =====================================================
+          PCSX2 Modern Netplay v0.5b all-in-one test build
+          =================================================
           Base: current PCSX2 master at build time (exact SHA in PCSX2_UPSTREAM_SHA.txt)
-          Protocol: v2 control protocol + proven v0.1 six-byte DS2 lockstep payload
+          Protocol: v3 host-authoritative multiplayer + synchronized boot
           Transport: reliable TCP
           Default port: 27886/TCP
-          Input delay: host selectable from 1 to 12 frames
 
-          New in this preview:
-          - Host selects the game inside the Netplay room from the PCSX2 game list.
-          - Game identity is strict Serial + CRC; the client resolves its own local image.
-          - Start stays disabled until both peers report the exact same game.
-          - PREPARE_BOOT causes both machines to auto-launch their local matching image.
-          - Normal/double-click game boot is blocked while a Netplay instance is configured,
-            so the synchronized room Start flow cannot be bypassed accidentally.
-          - Each VM initializes, reports BOOT_READY, and waits while paused.
-          - Host sends START_COMMIT only after both VMs are ready.
-          - A second FIRST_POLL barrier holds the first synchronized DS2 poll until both peers arrive.
-          - Input stalls >=250ms and >=1000ms are explicitly logged; hard input timeout is 30s.
-          - Same v0.1 input lockstep semantics remain after the synchronized start barrier.
+          Included in this single test build:
+          - Compact Chinese setup UI: separate Create Room / Join Room tabs.
+          - Dedicated Chinese lobby instead of one oversized all-in-one settings page.
+          - Host chooses the game only after entering the room; selection opens a separate game-list dialog.
+          - Strict Serial + CRC matching on every player before launch.
+          - Synchronized PREPARE_BOOT / BOOT_READY / START_COMMIT / FIRST_POLL_GO barriers.
+          - 1-4 player rooms. P1 is host; P2-P4 are network clients.
+          - 3-4 player rooms automatically enable Multitap and use PCSX2 slots 0,2,3,4.
+          - Host-authoritative input bundles: every poll waits for all configured players, then the same bundle is broadcast to every PC.
+          - Shadow memory-card synchronization. Host slot 1 is exported before boot and transferred to every player.
+          - Both host and clients run from NetplayShadow-<session>.ps2, so the user's original card is not overwritten by the Netplay session.
+          - Folder memory cards are exported to a raw shadow card; file memory cards are copied directly.
+          - No-card state is synchronized as well.
+          - Player table shows P1-P4, names, game match, memory-card state and boot-ready state.
+          - Session ID is shown in the room and recorded in logs for multi-machine diagnosis.
+          - Existing stall logging and one-click diagnostic ZIP collection remain included.
 
-          IMPORTANT: memory-card shadow synchronization is not enabled in this preview yet.
-          This build isolates synchronized game validation/boot first so its effect on v0.4 desync
-          can be tested independently before memory-card transfer is layered on top.
-
-          Test procedure:
-          1. Host: 联机 -> 创建房间 -> restart.
-          2. Client: 联机 -> 加入房间 -> restart.
-          3. Wait until both show 2 / 2.
-          4. Host selects one game in “同步游戏启动” and clicks “房主选择并同步此游戏”.
-          5. Confirm both rooms show identical Serial/CRC and 本机匹配/对方匹配 ✓.
-          6. Host clicks “开始同步游戏”. Do NOT manually double-click a game on either PC.
-          7. The faster PC must wait at BOOT_READY until the slower PC finishes loading.
-          8. Both must then pass START_COMMIT and FIRST_POLL_GO before gameplay advances.
-          9. If anything diverges, run Collect-Netplay-Diagnostics.bat on BOTH PCs and keep both ZIPs.
+          Test order:
+          1. Start with 2 players and Memory Card Sync enabled.
+          2. Confirm the room reaches 2/2.
+          3. Host clicks “选择游戏并开始...”, chooses a game once, and then does nothing else.
+          4. Both machines must automatically match, synchronize the shadow card, launch the same game and wait at the boot barriers.
+          5. Test save/load inside the game and verify the original host memory-card file is unchanged after the session.
+          6. Then test 3-player and 4-player games which support PS2 Multitap.
+          7. If any player desyncs or stalls, run Collect-Netplay-Diagnostics.bat on every participating PC and keep all ZIPs.
 
           No BIOS or game image is included.
           "@ | Set-Content -Encoding UTF8 src\bin\NETPLAY_BUILD_INFO.txt
@@ -144,14 +141,12 @@ jobs:
           @echo off
           setlocal
           set "PCSX2_NETPLAY_MODE=host"
+          set "PCSX2_NETPLAY_USERNAME=Host"
           set "PCSX2_NETPLAY_PORT=27886"
+          set "PCSX2_NETPLAY_PLAYERS=2"
           set "PCSX2_NETPLAY_DELAY=2"
+          set "PCSX2_NETPLAY_MEMCARD_SYNC=1"
           set "PCSX2_NETPLAY_SHOW_LOBBY=1"
-          echo ============================================================
-          echo PCSX2 Modern Netplay v0.5a - HOST fallback launcher
-          echo TCP port: %PCSX2_NETPLAY_PORT%   Input delay: %PCSX2_NETPLAY_DELAY%
-          echo Use the room to select and synchronously start the game.
-          echo ============================================================
           start "" "%~dp0pcsx2-qt.exe"
           endlocal
           '@ | Set-Content -Encoding ASCII src\bin\Netplay-Host.bat
@@ -162,15 +157,10 @@ jobs:
           set /p "NETPLAY_HOST=Host IPv4 or hostname: "
           if "%NETPLAY_HOST%"=="" exit /b 1
           set "PCSX2_NETPLAY_MODE=client"
+          set "PCSX2_NETPLAY_USERNAME=Player"
           set "PCSX2_NETPLAY_HOST=%NETPLAY_HOST%"
           set "PCSX2_NETPLAY_PORT=27886"
-          set "PCSX2_NETPLAY_DELAY=2"
           set "PCSX2_NETPLAY_SHOW_LOBBY=1"
-          echo ============================================================
-          echo PCSX2 Modern Netplay v0.5a - JOIN fallback launcher
-          echo Host: %PCSX2_NETPLAY_HOST%:%PCSX2_NETPLAY_PORT%
-          echo Wait for the host to select and synchronously start the game.
-          echo ============================================================
           start "" "%~dp0pcsx2-qt.exe"
           endlocal
           '@ | Set-Content -Encoding ASCII src\bin\Netplay-Join.bat
@@ -178,7 +168,7 @@ jobs:
       - name: Upload Windows x64 Netplay build
         uses: actions/upload-artifact@v4
         with:
-          name: PCSX2-modern-netplay-windows-x64-v0.5a-synchronized-boot-preview
+          name: PCSX2-modern-netplay-windows-x64-v0.5b-all-in-one
           path: src/bin
           if-no-files-found: error
           retention-days: 14

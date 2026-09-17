@@ -5,11 +5,13 @@
 
 #include <QtWidgets/QDialog>
 
-class QComboBox;
+class QCheckBox;
 class QLabel;
 class QLineEdit;
 class QPushButton;
 class QSpinBox;
+class QTabWidget;
+class QTableWidget;
 
 class NetplayDialog final : public QDialog
 {
@@ -17,35 +19,35 @@ public:
     explicit NetplayDialog(QWidget* parent = nullptr);
 
 private:
-    void updateModeUi();
-    void updateDelayHint();
-    void refreshRuntimeStatus();
-    void populateGameList();
-    void syncSelectedGame();
-    void requestStartGame();
+    void buildSetupUi();
+    void buildLobbyUi();
+    void refreshLobby();
+    void launchHost();
+    void launchClient();
+    void launchNormalInstance();
+    void chooseGameAndStart();
     void launchPendingNetplayGame(const QString& path);
     void openLogFolder();
-    void copyLogPath();
-    void launchConfiguredInstance();
-    void launchNormalInstance();
+    void exportDiagnostics();
 
-    QLabel* m_current_status = nullptr;
-    QLabel* m_room_state = nullptr;
-    QLabel* m_player_count = nullptr;
-    QLabel* m_peer = nullptr;
-    QLabel* m_runtime_delay = nullptr;
-    QLabel* m_log_path = nullptr;
+    bool m_lobby_mode = false;
 
-    QComboBox* m_game_combo = nullptr;
-    QPushButton* m_sync_game = nullptr;
+    // Setup mode.
+    QLineEdit* m_username = nullptr;
+    QTabWidget* m_tabs = nullptr;
+    QSpinBox* m_host_port = nullptr;
+    QSpinBox* m_host_players = nullptr;
+    QSpinBox* m_host_delay = nullptr;
+    QCheckBox* m_memcard_sync = nullptr;
+    QLineEdit* m_join_address = nullptr;
+    QSpinBox* m_join_port = nullptr;
+
+    // Lobby mode.
+    QLabel* m_room_status = nullptr;
     QLabel* m_game_status = nullptr;
+    QLabel* m_memcard_status = nullptr;
     QLabel* m_boot_status = nullptr;
+    QLabel* m_session_status = nullptr;
+    QTableWidget* m_players_table = nullptr;
     QPushButton* m_start_game = nullptr;
-
-    QComboBox* m_mode = nullptr;
-    QLineEdit* m_host = nullptr;
-    QSpinBox* m_port = nullptr;
-    QSpinBox* m_delay = nullptr;
-    QLabel* m_delay_hint = nullptr;
-    QPushButton* m_launch = nullptr;
 };
