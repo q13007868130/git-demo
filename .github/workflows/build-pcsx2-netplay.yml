@@ -101,7 +101,7 @@ jobs:
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.ps1 src\bin\Collect-Netplay-Diagnostics.ps1 -Force
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.bat src\bin\Collect-Netplay-Diagnostics.bat -Force
           @"
-          PCSX2 Modern Netplay v0.5b-r2 recovery + memory-card fix
+          PCSX2 Modern Netplay v0.5b-r3 Unicode memory-card path fix
           =================================================
           Base: current PCSX2 master at build time (exact SHA in PCSX2_UPSTREAM_SHA.txt)
           Protocol: v3 host-authoritative multiplayer + synchronized boot
@@ -109,6 +109,8 @@ jobs:
           Default port: 27886/TCP
 
           Included in this single test build:
+          - v0.5b-r3: fix Windows Unicode/Chinese memory-card paths by using PCSX2 FileSystem APIs instead of narrow std::ifstream/std::ofstream.
+          - v0.5b-r3: shadow-card creation and cleanup also use PCSX2 UTF-8-aware filesystem APIs.
           - v0.5b-r2: fix real Slot 1 file/folder detection before VM boot.
           - v0.5b-r2: memory-card errors cancel only the current Start attempt; the room remains reusable.
           - v0.5b-r2: add “重建连接” and automatic failed-lobby recovery without restarting PCSX2.
@@ -176,7 +178,7 @@ jobs:
       - name: Upload Windows x64 Netplay build
         uses: actions/upload-artifact@v4
         with:
-          name: PCSX2-modern-netplay-windows-x64-v0.5b-r2
+          name: PCSX2-modern-netplay-windows-x64-v0.5b-r3
           path: src/bin
           if-no-files-found: error
           retention-days: 14

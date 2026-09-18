@@ -7,6 +7,8 @@
 #include "Counters.h"
 #include "GameList.h"
 #include "Host.h"
+#include "common/FileSystem.h"
+#include "common/Path.h"
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Memcard/MemoryCardFolder.h"
 
@@ -21,7 +23,6 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
-#include <fstream>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -607,11 +608,10 @@ namespace
             }
             if (!shadow_to_remove.empty())
             {
-                std::error_code remove_error;
-                std::filesystem::remove(
-                    std::filesystem::path(EmuFolders::MemoryCards) / shadow_to_remove, remove_error);
+                const std::string shadow_path = Path::Combine(EmuFolders::MemoryCards, shadow_to_remove);
+                const bool removed = FileSystem::DeleteFilePath(shadow_path.c_str());
                 Log("removed Netplay shadow card: %s%s", shadow_to_remove.c_str(),
-                    remove_error ? " (cleanup warning)" : "");
+                    removed ? "" : " (cleanup warning)");
             }
 
             Log("session stopped");
@@ -1341,31 +1341,27 @@ namespace
                 return false;
             }
 
-            Log("memory card source resolved: name=%s type=%s path=%s size=%u",
+            Log("memory card source resolved: name=%s type=%s path=%s size=%u utf8_path=yes",
                 filename.c_str(), info->type == MemoryCardType::Folder ? "folder" : "file",
                 info->path.c_str(), static_cast<unsigned>(info->size));
 
             if (info->type == MemoryCardType::File)
             {
-                std::ifstream file(info->path, std::ios::binary | std::ios::ate);
-                if (!file)
+                std::optional<std::vector<u8>> file_data = FileSystem::ReadBinaryFile(info->path.c_str());
+                if (!file_data.has_value())
                 {
                     *error = "无法读取房主记忆卡文件：" + info->path;
                     return false;
                 }
-                const std::streamsize size = file.tellg();
-                if (size <= 0 || size > (80ll * 1024ll * 1024ll))
+                if (file_data->empty() || file_data->size() > (80u * 1024u * 1024u))
                 {
                     *error = "房主记忆卡大小异常";
                     return false;
                 }
-                data->resize(static_cast<std::size_t>(size));
-                file.seekg(0, std::ios::beg);
-                if (!file.read(reinterpret_cast<char*>(data->data()), size))
-                {
-                    *error = "读取房主记忆卡失败";
-                    return false;
-                }
+
+                data->assign(file_data->begin(), file_data->end());
+                Log("memory card file read via PCSX2 filesystem: bytes=%u",
+                    static_cast<unsigned>(data->size()));
                 *present = true;
                 return true;
             }
@@ -1425,17 +1421,26 @@ namespace
                 out_filename->clear();
                 return true;
             }
-            std::error_code ec;
-            std::filesystem::create_directories(EmuFolders::MemoryCards, ec);
+
+            if (!FileSystem::DirectoryExists(EmuFolders::MemoryCards.c_str()) &&
+                !FileSystem::CreateDirectoryPath(EmuFolders::MemoryCards.c_str(), true))
+            {
+                Log("failed to create memory-card directory: %s", EmuFolders::MemoryCards.c_str());
+                return false;
+            }
+
             char name[96]{};
-            std::snprintf(name, sizeof(name), "NetplayShadow-%016llX.ps2", static_cast<unsigned long long>(m_session_id));
-            const std::filesystem::path path = std::filesystem::path(EmuFolders::MemoryCards) / name;
-            std::ofstream file(path, std::ios::binary | std::ios::trunc);
-            if (!file)
+            std::snprintf(name, sizeof(name), "NetplayShadow-%016llX.ps2",
+                static_cast<unsigned long long>(m_session_id));
+            const std::string path = Path::Combine(EmuFolders::MemoryCards, name);
+            if (!FileSystem::WriteBinaryFile(path.c_str(), data.data(), data.size()))
+            {
+                Log("failed to write Netplay shadow card: %s", path.c_str());
                 return false;
-            file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
-            if (!file)
-                return false;
+            }
+
+            Log("Netplay shadow card written via PCSX2 filesystem: %s bytes=%u",
+                path.c_str(), static_cast<unsigned>(data.size()));
             *out_filename = name;
             return true;
         }
