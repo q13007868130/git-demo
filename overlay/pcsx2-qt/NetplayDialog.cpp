@@ -284,7 +284,7 @@ void NetplayDialog::buildLobbyUi()
     m_topology_mode->addItem(tr("兼容模式 A：Multitap 接 1 号端口（暴走单车等）"), 0);
     m_topology_mode->addItem(tr("兼容模式 B：Multitap 接 2 号端口（按 Start 加入类）"), 1);
     m_topology_mode->setCurrentIndex(lobby_status.topology_mode == 0 ? 0 : 1);
-    runtime_form->addRow(tr("多人手柄布局："), m_topology_mode);
+    runtime_form->addRow(tr("Multitap 布局（全房间）："), m_topology_mode);
 
     m_apply_runtime = new QPushButton(tr("应用实时设置"), m_runtime_group);
     runtime_form->addRow(QString(), m_apply_runtime);
@@ -292,7 +292,7 @@ void NetplayDialog::buildLobbyUi()
         tr("输入延迟可在游戏中实时调整，并在全员相同的输入检查点统一生效。"
            "1～2 人房固定连接1=P1、连接2=P2，禁止互换；3～4 人房才开放 P1～P4 调整。"
            "房间人数可实时增加到 4 人，游戏途中加入的新玩家会在当前房间等待下一局。"
-           "多人手柄布局涉及虚拟硬件，游戏运行中仍会锁定。"), m_runtime_group);
+           "Multitap 是全房间统一硬件布局：3～4 人房由房主设置，游戏运行中锁定，切换游戏后可修改下一局。"), m_runtime_group);
     runtime_note->setWordWrap(true);
     runtime_form->addRow(QString(), runtime_note);
     root->addWidget(m_runtime_group);
@@ -697,13 +697,15 @@ void NetplayDialog::refreshLobby()
     const bool vm_active = QtHost::IsVMValid();
     m_runtime_delay->setEnabled(is_host && !status.runtime_reconfiguring);
     m_runtime_players->setEnabled(is_host && status.max_players < ModernNetplay::MAX_PLAYERS && !status.runtime_reconfiguring);
-    m_topology_mode->setEnabled(is_host && status.round_players >= 3 && !vm_active && !status.runtime_reconfiguring);
+    m_topology_mode->setEnabled(is_host && status.max_players >= 3 && !vm_active && !status.runtime_reconfiguring);
     if (!is_host)
         m_topology_mode->setToolTip(tr("这是整个房间共用的 Multitap 硬件布局，仅房主可以修改。"));
     else if (vm_active)
-        m_topology_mode->setToolTip(tr("多人手柄布局会改变虚拟 PS2 硬件，游戏运行中不能修改；请切换游戏后调整。"));
+        m_topology_mode->setToolTip(tr("这是全房间共用的 Multitap 硬件布局。游戏运行中不能切换；请点“切换游戏”回到房间后设置下一局。"));
+    else if (status.max_players < 3)
+        m_topology_mode->setToolTip(tr("1～2 人不需要 Multitap；房间扩到 3～4 人后由房主选择布局。"));
     else
-        m_topology_mode->setToolTip(QString());
+        m_topology_mode->setToolTip(tr("全房间统一设置，由房主选择；下一次同步启动时所有玩家使用同一布局。"));
 
     const bool controller_swapping_allowed = (status.round_players >= 3);
     m_local_controller->setEnabled(controller_swapping_allowed && !status.runtime_reconfiguring);
