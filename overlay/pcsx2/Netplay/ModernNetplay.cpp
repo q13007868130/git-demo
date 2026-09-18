@@ -675,7 +675,7 @@ namespace
         bool RequestRuntimeSettingsImpl(std::uint32_t local_controller,
             std::uint32_t delay, std::uint32_t topology)
         {
-            return RequestRuntimeSettingsImpl(local_controller, delay, topology);
+            return RequestRuntimeSettings(local_controller, delay, topology);
         }
 
     private:
@@ -2843,7 +2843,7 @@ bool RequestSynchronizedBoot() { return GetSession().RequestSynchronizedBoot(); 
 bool ConsumeBootLaunchRequest(std::string* path) { return GetSession().ConsumeBootLaunchRequest(path); }
 bool RequestRuntimeSettings(std::uint32_t local_controller, std::uint32_t delay, std::uint32_t topology_mode)
 {
-    return GetSession().RequestRuntimeSettings(local_controller, delay, topology_mode);
+    return GetSession().RequestRuntimeSettingsImpl(local_controller, delay, topology_mode);
 }
 bool CanStartVM() { return GetSession().CanStartVM(); }
 bool ShouldHoldBootBarrier() { return GetSession().ShouldHoldBootBarrier(); }
