@@ -101,14 +101,19 @@ jobs:
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.ps1 src\bin\Collect-Netplay-Diagnostics.ps1 -Force
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.bat src\bin\Collect-Netplay-Diagnostics.bat -Force
           @"
-          PCSX2 Modern Netplay v0.5b-r3 Unicode memory-card path fix
+          PCSX2 Modern Netplay v0.5b-r4 full DualShock2 pressure sync
           =================================================
           Base: current PCSX2 master at build time (exact SHA in PCSX2_UPSTREAM_SHA.txt)
-          Protocol: v3 host-authoritative multiplayer + synchronized boot
+          Protocol: v4 host-authoritative multiplayer + full 18-byte DualShock2 input + synchronized boot
           Transport: reliable TCP
           Default port: 27886/TCP
 
           Included in this single test build:
+          - v0.5b-r4: synchronize the complete 18-byte DualShock2 response, not only the legacy 6 bytes.
+          - v0.5b-r4: adds the 12 pressure-sensitive button bytes (D-pad, face buttons, L1/R1/L2/R2); this targets games such as 爆走マウンテンバイカーズ which can use pressure values for menu/game transitions.
+          - v0.5b-r4: protocol bumped to v4; all players must use the same r4 build.
+          - v0.5b-r4: log local digital/pressure transitions to make game-specific desyncs diagnosable without logging every analog sample.
+          - v0.5b-r4: still builds against current PCSX2 master at CI build time.
           - v0.5b-r3: fix Windows Unicode/Chinese memory-card paths by using PCSX2 FileSystem APIs instead of narrow std::ifstream/std::ofstream.
           - v0.5b-r3: shadow-card creation and cleanup also use PCSX2 UTF-8-aware filesystem APIs.
           - v0.5b-r2: fix real Slot 1 file/folder detection before VM boot.
@@ -178,7 +183,7 @@ jobs:
       - name: Upload Windows x64 Netplay build
         uses: actions/upload-artifact@v4
         with:
-          name: PCSX2-modern-netplay-windows-x64-v0.5b-r3
+          name: PCSX2-modern-netplay-windows-x64-v0.5b-r4
           path: src/bin
           if-no-files-found: error
           retention-days: 14

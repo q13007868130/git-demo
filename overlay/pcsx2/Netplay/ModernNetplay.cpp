@@ -42,14 +42,15 @@ namespace ModernNetplay
 #ifdef _WIN32
 namespace
 {
-    using InputFrame = std::array<std::uint8_t, 6>;
+    static constexpr std::size_t INPUT_FRAME_BYTES = 18;
+    using InputFrame = std::array<std::uint8_t, INPUT_FRAME_BYTES>;
     using InputBundle = std::array<InputFrame, MAX_PLAYERS>;
 
     constexpr std::uint32_t HELLO_MAGIC = 0x50324E50;   // P2NP
     constexpr std::uint32_t INPUT_MAGIC = 0x494E5054;   // INPT
     constexpr std::uint32_t BUNDLE_MAGIC = 0x424E444C;  // BNDL
     constexpr std::uint32_t CONTROL_MAGIC = 0x43544C31; // CTL1
-    constexpr std::uint32_t PROTOCOL_VERSION = 3;
+    constexpr std::uint32_t PROTOCOL_VERSION = 4;
     constexpr std::uint16_t DEFAULT_PORT = 27886;
     constexpr int RECEIVE_TIMEOUT_SECONDS = 30;
     constexpr int BOOT_BARRIER_TIMEOUT_SECONDS = 90;
@@ -57,7 +58,17 @@ namespace
     constexpr std::uint32_t MAX_CONTROL_PAYLOAD = 64 * 1024;
     constexpr std::uint32_t MEMCARD_CHUNK = 60 * 1024;
     constexpr std::size_t HELLO_SIZE = 80;
-    constexpr InputFrame NEUTRAL_FRAME = {0xff, 0xff, 0x7f, 0x7f, 0x7f, 0x7f};
+    constexpr std::size_t INPUT_PACKET_SIZE = 12 + INPUT_FRAME_BYTES;
+    constexpr std::size_t INPUT_REST_SIZE = 8 + INPUT_FRAME_BYTES;
+    constexpr std::size_t BUNDLE_PACKET_SIZE = 12 + (MAX_PLAYERS * INPUT_FRAME_BYTES);
+    constexpr std::size_t BUNDLE_REST_SIZE = 8 + (MAX_PLAYERS * INPUT_FRAME_BYTES);
+    constexpr InputFrame NEUTRAL_FRAME = {
+        0xff, 0xff,                   // digital buttons
+        0x7f, 0x7f, 0x7f, 0x7f,     // right/left analog axes
+        0x00, 0x00, 0x00, 0x00,     // d-pad pressure
+        0x00, 0x00, 0x00, 0x00,     // triangle/circle/cross/square pressure
+        0x00, 0x00, 0x00, 0x00      // L1/R1/L2/R2 pressure
+    };
 
     enum class Role : std::uint32_t
     {
@@ -514,7 +525,7 @@ namespace
         std::uint8_t HandlePadResponse(std::uint8_t unified_slot,
             std::uint32_t command_index, std::uint8_t local_value)
         {
-            if (m_role == Role::Disabled || command_index < 3 || command_index > 8)
+            if (m_role == Role::Disabled || command_index < 3 || command_index > 20)
                 return local_value;
 
             const std::size_t input_index = static_cast<std::size_t>(command_index - 3);
@@ -1752,9 +1763,29 @@ namespace
             return true;
         }
 
+        void LogLocalInputTransition(std::uint32_t frame, const InputFrame& input)
+        {
+            bool changed = (input[0] != m_last_logged_local_input[0] || input[1] != m_last_logged_local_input[1]);
+            for (std::size_t i = 6; i < INPUT_FRAME_BYTES && !changed; i++)
+                changed = (input[i] != m_last_logged_local_input[i]);
+            if (!changed)
+                return;
+
+            Log("INPUT P%u poll=%u digital=%02X %02X pressure[dpad R,L,U,D=%u,%u,%u,%u face T,O,X,S=%u,%u,%u,%u shoulders=%u,%u,%u,%u]",
+                static_cast<unsigned>(m_local_player_id), static_cast<unsigned>(frame),
+                static_cast<unsigned>(input[0]), static_cast<unsigned>(input[1]),
+                static_cast<unsigned>(input[6]), static_cast<unsigned>(input[7]),
+                static_cast<unsigned>(input[8]), static_cast<unsigned>(input[9]),
+                static_cast<unsigned>(input[10]), static_cast<unsigned>(input[11]),
+                static_cast<unsigned>(input[12]), static_cast<unsigned>(input[13]),
+                static_cast<unsigned>(input[14]), static_cast<unsigned>(input[15]),
+                static_cast<unsigned>(input[16]), static_cast<unsigned>(input[17]));
+            m_last_logged_local_input = input;
+        }
+
         bool SendInputToHost(std::uint32_t frame, const InputFrame& input)
         {
-            std::array<std::uint8_t, 18> packet{};
+            std::array<std::uint8_t, INPUT_PACKET_SIZE> packet{};
             WriteU32(packet.data(), INPUT_MAGIC);
             WriteU32(packet.data() + 4, frame);
             WriteU32(packet.data() + 8, m_local_player_id);
@@ -1766,12 +1797,12 @@ namespace
 
         void BroadcastBundle(std::uint32_t frame, const InputBundle& bundle)
         {
-            std::array<std::uint8_t, 36> packet{};
+            std::array<std::uint8_t, BUNDLE_PACKET_SIZE> packet{};
             WriteU32(packet.data(), BUNDLE_MAGIC);
             WriteU32(packet.data() + 4, frame);
             WriteU32(packet.data() + 8, m_max_players);
             for (std::size_t i = 0; i < MAX_PLAYERS; i++)
-                std::memcpy(packet.data() + 12 + i * 6, bundle[i].data(), 6);
+                std::memcpy(packet.data() + 12 + i * INPUT_FRAME_BYTES, bundle[i].data(), INPUT_FRAME_BYTES);
 
             std::lock_guard<std::mutex> lock(m_peer_mutex);
             for (auto& peer : m_peers)
@@ -1849,6 +1880,7 @@ namespace
 
             if (m_have_capture)
             {
+                LogLocalInputTransition(m_frame, m_capture);
                 if (m_role == Role::Host)
                 {
                     {
@@ -1932,7 +1964,7 @@ namespace
                 const std::uint32_t magic = ReadU32(magic_bytes.data());
                 if (magic == INPUT_MAGIC)
                 {
-                    std::array<std::uint8_t, 14> rest{};
+                    std::array<std::uint8_t, INPUT_REST_SIZE> rest{};
                     if (!ReceiveAll(peer->socket, rest.data(), rest.size()))
                         break;
                     const std::uint32_t frame = ReadU32(rest.data());
@@ -2007,7 +2039,7 @@ namespace
                 const std::uint32_t magic = ReadU32(magic_bytes.data());
                 if (magic == BUNDLE_MAGIC)
                 {
-                    std::array<std::uint8_t, 32> rest{};
+                    std::array<std::uint8_t, BUNDLE_REST_SIZE> rest{};
                     if (!ReceiveAll(socket, rest.data(), rest.size()))
                         break;
                     const std::uint32_t frame = ReadU32(rest.data());
@@ -2020,7 +2052,7 @@ namespace
                     InputBundle bundle{};
                     bundle.fill(NEUTRAL_FRAME);
                     for (std::size_t i = 0; i < MAX_PLAYERS; i++)
-                        std::memcpy(bundle[i].data(), rest.data() + 8 + i * 6, 6);
+                        std::memcpy(bundle[i].data(), rest.data() + 8 + i * INPUT_FRAME_BYTES, INPUT_FRAME_BYTES);
                     {
                         std::lock_guard<std::mutex> lock(m_bundle_mutex);
                         m_bundles[frame] = bundle;
@@ -2243,6 +2275,7 @@ namespace
         std::uint32_t m_frame = 0;
         bool m_have_capture = false;
         InputFrame m_capture = NEUTRAL_FRAME;
+        InputFrame m_last_logged_local_input = NEUTRAL_FRAME;
         InputBundle m_output_bundle = {NEUTRAL_FRAME, NEUTRAL_FRAME, NEUTRAL_FRAME, NEUTRAL_FRAME};
         std::array<std::unordered_map<std::uint32_t, InputFrame>, MAX_PLAYERS> m_player_inputs;
         std::unordered_map<std::uint32_t, InputBundle> m_bundles;

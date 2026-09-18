@@ -93,6 +93,8 @@ namespace ModernNetplay
     bool ShouldForceDualShock2Slot(std::uint32_t unified_slot);
     bool ShouldDisconnectControllerSlot(std::uint32_t unified_slot);
 
+    // Synchronizes the complete DualShock 2 POLL response (bytes 3..20):
+    // digital buttons, analog sticks, and all pressure-sensitive buttons.
     std::uint8_t HandlePadResponse(std::uint8_t unified_slot,
         std::uint32_t command_index, std::uint8_t local_value);
 

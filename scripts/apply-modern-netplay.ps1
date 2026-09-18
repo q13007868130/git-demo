@@ -54,7 +54,7 @@ if ($text.Contains($oldController)) {
 # or completed game makes the lobby unrecoverable until PCSX2 itself restarts.
 Write-Text $padCpp $text
 
-# Intercept the legacy-compatible six DualShock2 response bytes.
+# Intercept the full DualShock2 response: digital + analog + pressure bytes (3..20).
 $text = Read-Text $ds2Cpp
 if ($text -notmatch 'Netplay/ModernNetplay.h') {
     $needle = '#include "SIO/Pad/Pad.h"'
@@ -66,7 +66,7 @@ if ($text -notmatch 'ModernNetplay::HandlePadResponse') {
     $index = $text.LastIndexOf($increment)
     if ($index -lt 0) { throw 'PadDualshock2.cpp command counter anchor not found' }
     $hook = @'
-	if (this->currentCommand == Pad::Command::POLL && this->commandBytesReceived >= 3 && this->commandBytesReceived <= 8)
+	if (this->currentCommand == Pad::Command::POLL && this->commandBytesReceived >= 3 && this->commandBytesReceived <= 20)
 	{
 		ret = ModernNetplay::HandlePadResponse(this->unifiedSlot,
 			static_cast<std::uint32_t>(this->commandBytesReceived), ret);
