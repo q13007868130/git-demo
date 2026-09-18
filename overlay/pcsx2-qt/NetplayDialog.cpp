@@ -275,9 +275,9 @@ void NetplayDialog::buildLobbyUi()
     m_apply_runtime = new QPushButton(tr("应用实时设置"), runtime_group);
     runtime_form->addRow(QString(), m_apply_runtime);
     auto* runtime_note = new QLabel(
-        tr("每个玩家都可以在游戏开始后或游戏途中切换自己控制的 P1～P4。"
-           "延迟和多人手柄布局由房主统一调整；运行中应用时会让所有机器短暂停顿，"
-           "同步重载手柄并重新建立输入同步点，不需要重启游戏或联机。"), runtime_group);
+        tr("游戏运行中仍可切换自己控制的 P1～P4。为避免破坏模拟时间线，"
+           "输入延迟和多人手柄布局只允许在游戏开始前调整；游戏启动后这两项会锁定。"
+           "检测到持续不同步时，所有玩家会自动暂停并弹出提示。"), runtime_group);
     runtime_note->setWordWrap(true);
     runtime_form->addRow(QString(), runtime_note);
     root->addWidget(runtime_group);
@@ -337,8 +337,17 @@ void NetplayDialog::buildLobbyUi()
             static_cast<std::uint32_t>(m_runtime_delay->value()) : current.delay;
         const std::uint32_t topology = (current.role == "host") ?
             static_cast<std::uint32_t>(m_topology_mode->currentData().toUInt()) : current.topology_mode;
+        if (QtHost::IsVMValid() && current.role == "host" &&
+            (delay != current.delay || topology != current.topology_mode))
+        {
+            QMessageBox::information(this, tr("实时联机设置"),
+                tr("为防止联机不同步，游戏运行中不能修改输入延迟或多人手柄布局。\n\n"
+                   "运行中仍可切换 P1～P4 控制位；延迟和布局请在下一局开始前调整。"));
+            return;
+        }
         if (!ModernNetplay::RequestRuntimeSettings(controller, delay, topology))
-            QMessageBox::warning(this, tr("实时联机设置"), tr("无法应用设置。可能正在进行另一项同步调整，请稍后再试。"));
+            QMessageBox::warning(this, tr("实时联机设置"),
+                tr("无法应用设置。可能正在进行另一项同步调整，或当前修改会破坏运行中的同步时间线。"));
     });
     connect(leave_button, &QPushButton::clicked, this, [this]() { launchNormalInstance(); });
 
@@ -535,8 +544,9 @@ void NetplayDialog::refreshLobby()
         m_runtime_delay->setValue(static_cast<int>(status.delay));
     if (m_topology_mode && !m_topology_mode->hasFocus())
         m_topology_mode->setCurrentIndex(status.topology_mode == 0 ? 0 : 1);
-    m_runtime_delay->setEnabled(is_host && !status.runtime_reconfiguring);
-    m_topology_mode->setEnabled(is_host && status.max_players >= 3 && !status.runtime_reconfiguring);
+    const bool vm_active = QtHost::IsVMValid();
+    m_runtime_delay->setEnabled(is_host && !vm_active && !status.runtime_reconfiguring);
+    m_topology_mode->setEnabled(is_host && status.max_players >= 3 && !vm_active && !status.runtime_reconfiguring);
     m_local_controller->setEnabled(!status.runtime_reconfiguring);
     m_apply_runtime->setEnabled(!status.runtime_reconfiguring);
 
