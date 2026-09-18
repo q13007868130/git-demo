@@ -52,7 +52,7 @@ namespace
     constexpr std::uint32_t INPUT_MAGIC = 0x494E5054;   // INPT
     constexpr std::uint32_t BUNDLE_MAGIC = 0x424E444C;  // BNDL
     constexpr std::uint32_t CONTROL_MAGIC = 0x43544C31; // CTL1
-    constexpr std::uint32_t PROTOCOL_VERSION = 6;
+    constexpr std::uint32_t PROTOCOL_VERSION = 7;
     constexpr std::uint16_t DEFAULT_PORT = 27886;
     constexpr int RECEIVE_TIMEOUT_SECONDS = 30;
     constexpr int BOOT_BARRIER_TIMEOUT_SECONDS = 90;
@@ -99,6 +99,7 @@ namespace
         RuntimeApply = 15,
         RuntimeAck = 16,
         RuntimeCommit = 17,
+        SyncCheckpoint = 18,
     };
 
     struct PlayerState
@@ -527,6 +528,26 @@ namespace
             if (!IsConfigured())
                 return;
 
+            // Normalize state-affecting user settings before PCSX2 applies the
+            // shared game-database overrides. This removes per-machine timing
+            // differences while still allowing identical game fixes on all peers.
+            EmuConfig.Cpu = Pcsx2Config::CpuOptions();
+            EmuConfig.Speedhacks.DisableAll();
+            EmuConfig.EmulationSpeed.NominalScalar = 1.0f;
+            EmuConfig.EmulationSpeed.SyncToHostRefreshRate = false;
+            EmuConfig.EmulationSpeed.UseVSyncForTiming = false;
+            EmuConfig.GS.FramerateNTSC = Pcsx2Config::GSOptions::DEFAULT_FRAME_RATE_NTSC;
+            EmuConfig.GS.FrameratePAL = Pcsx2Config::GSOptions::DEFAULT_FRAME_RATE_PAL;
+            EmuConfig.EnableCheats = false;
+            EmuConfig.EnableWideScreenPatches = false;
+            EmuConfig.EnableNoInterlacingPatches = false;
+            EmuConfig.EnableFastBoot = true;
+
+            Log("deterministic core normalized: CPU=default speedhacks=off nominal=100%% "
+                "NTSC=%.2f PAL=%.2f cheats=off widescreen=off nointerlace=off",
+                static_cast<double>(EmuConfig.GS.FramerateNTSC),
+                static_cast<double>(EmuConfig.GS.FrameratePAL));
+
             const std::uint32_t topology = m_topology_mode.load(std::memory_order_acquire);
             EmuConfig.Pad.MultitapPort0_Enabled = (m_max_players >= 3 && topology == 0);
             EmuConfig.Pad.MultitapPort1_Enabled = (m_max_players >= 3 && topology == 1);
@@ -867,6 +888,8 @@ namespace
             m_have_capture = false;
             m_capture = NEUTRAL_FRAME;
             m_output_bundle.fill(NEUTRAL_FRAME);
+            m_host_sync_checkpoints.clear();
+            m_desync_strikes.fill(0);
             for (auto& player : m_players)
             {
                 player.memcard_ready = false;
@@ -1961,6 +1984,32 @@ namespace
         {
             if (delay < 1 || delay > 100 || topology > 1 || !ValidateControllerMap(controllers))
                 return false;
+
+            const std::uint32_t old_delay = m_delay.load(std::memory_order_acquire);
+            const std::uint32_t old_topology = m_topology_mode.load(std::memory_order_acquire);
+            const bool timing_changed = (delay != old_delay || topology != old_topology);
+            if (timing_changed && VMManager::HasValidVM())
+                return false;
+
+            // Controller ownership can change live without resetting the input epoch.
+            // The host is authoritative for player->controller routing.
+            if (!timing_changed)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(m_state_mutex);
+                    m_runtime_reconfiguring = true;
+                    m_runtime_change_id = change_id;
+                    for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                        m_players[i].controller = controllers[i];
+                }
+                Log("runtime controller map locally applied: change=%u controllers=%u,%u,%u,%u",
+                    static_cast<unsigned>(change_id),
+                    static_cast<unsigned>(controllers[0]), static_cast<unsigned>(controllers[1]),
+                    static_cast<unsigned>(controllers[2]), static_cast<unsigned>(controllers[3]));
+                return true;
+            }
+
+            // Delay/topology changes are only safe before the VM starts.
             PauseForRuntimeReconfigure();
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
@@ -1976,7 +2025,7 @@ namespace
             m_topology_mode.store(topology, std::memory_order_release);
             ResetRuntimeInputEpoch(change_id);
             ReloadRuntimePads();
-            Log("runtime config locally applied: change=%u delay=%u topology=%u controllers=%u,%u,%u,%u",
+            Log("runtime config locally applied before VM start: change=%u delay=%u topology=%u controllers=%u,%u,%u,%u",
                 static_cast<unsigned>(change_id), static_cast<unsigned>(delay), static_cast<unsigned>(topology),
                 static_cast<unsigned>(controllers[0]), static_cast<unsigned>(controllers[1]),
                 static_cast<unsigned>(controllers[2]), static_cast<unsigned>(controllers[3]));
@@ -2042,6 +2091,24 @@ namespace
             if (m_role != Role::Host || delay < 1 || delay > 100 || topology > 1 ||
                 !ValidateControllerMap(controllers))
                 return false;
+
+            const std::uint32_t current_delay = m_delay.load(std::memory_order_acquire);
+            const std::uint32_t current_topology = m_topology_mode.load(std::memory_order_acquire);
+            const auto current_controllers = CurrentControllerMap();
+            if (delay == current_delay && topology == current_topology && controllers == current_controllers)
+            {
+                Log("runtime settings request ignored: no changes");
+                return true;
+            }
+            if (VMManager::HasValidVM() && (delay != current_delay || topology != current_topology))
+            {
+                SetLastError("游戏运行中为防止不同步，只允许更换控制位；输入延迟和多人手柄布局请在下一局开始前调整");
+                Log("runtime timing/topology change rejected while VM is active: delay %u->%u topology %u->%u",
+                    static_cast<unsigned>(current_delay), static_cast<unsigned>(delay),
+                    static_cast<unsigned>(current_topology), static_cast<unsigned>(topology));
+                return false;
+            }
+
             std::uint32_t change_id = 0;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
@@ -2150,15 +2217,17 @@ namespace
                 "检测到联机连接或同步异常，当前游戏已暂停。\n\n原因：" + reason +
                 "\n\n请不要继续单独推进游戏。建议所有玩家回到联机大厅重新连接；如问题重复出现，请导出诊断包。";
 
-            Host::RunOnCPUThread([message]() {
+            const bool desync = (reason.find("不同步") != std::string::npos);
+            Host::RunOnCPUThread([message, desync]() {
                 if (VMManager::HasValidVM())
                 {
                     VMManager::SetState(VMState::Paused);
                     Host::AddKeyedOSDMessage("ModernNetplayDisconnected",
-                        "联机已中断，游戏已暂停。", Host::OSD_CRITICAL_ERROR_DURATION);
+                        desync ? "检测到联机不同步，游戏已暂停。" : "联机已中断，游戏已暂停。",
+                        Host::OSD_CRITICAL_ERROR_DURATION);
                 }
             });
-            Host::ReportErrorAsync("PCSX2 联机已中断", message);
+            Host::ReportErrorAsync(desync ? "PCSX2 检测到联机不同步" : "PCSX2 联机已中断", message);
         }
 
         bool SendInputToHost(std::uint32_t frame, const InputFrame& input)
@@ -2241,6 +2310,66 @@ namespace
             return true;
         }
 
+        void RecordHostSyncCheckpoint(std::uint32_t poll, std::uint64_t vsync)
+        {
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            m_host_sync_checkpoints[poll] = vsync;
+            if (poll >= (LOG_FRAME_INTERVAL * 20u))
+                m_host_sync_checkpoints.erase(poll - (LOG_FRAME_INTERVAL * 20u));
+        }
+
+        void SendClientSyncCheckpoint(std::uint32_t poll, std::uint64_t vsync)
+        {
+            std::array<std::uint8_t, 12> payload{};
+            WriteU32(payload.data(), poll);
+            WriteU64(payload.data() + 4, vsync);
+            if (!SendControlToHost(ControlType::SyncCheckpoint, payload.data(),
+                    static_cast<std::uint32_t>(payload.size())))
+                Fail("failed to send synchronization checkpoint");
+        }
+
+        void HandlePeerSyncCheckpoint(std::uint32_t player_id, const std::vector<std::uint8_t>& payload)
+        {
+            if (m_role != Role::Host || player_id < 2 || player_id > m_max_players || payload.size() != 12)
+                return;
+
+            const std::uint32_t poll = ReadU32(payload.data());
+            const std::uint64_t peer_vsync = ReadU64(payload.data() + 4);
+            std::uint64_t host_vsync = 0;
+            std::uint32_t strikes = 0;
+            bool trigger = false;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                const auto it = m_host_sync_checkpoints.find(poll);
+                if (it == m_host_sync_checkpoints.end())
+                    return;
+                host_vsync = it->second;
+                const std::uint64_t delta = (host_vsync >= peer_vsync) ?
+                    (host_vsync - peer_vsync) : (peer_vsync - host_vsync);
+                std::uint32_t& counter = m_desync_strikes[player_id - 1];
+                counter = (delta >= 2u) ? (counter + 1u) : 0u;
+                strikes = counter;
+                trigger = (counter >= 3u);
+            }
+
+            const long long signed_delta = static_cast<long long>(host_vsync) -
+                static_cast<long long>(peer_vsync);
+            Log("SYNC_CHECK P%u poll=%u host_vsync=%llu peer_vsync=%llu delta=%lld strikes=%u",
+                static_cast<unsigned>(player_id), static_cast<unsigned>(poll),
+                static_cast<unsigned long long>(host_vsync),
+                static_cast<unsigned long long>(peer_vsync),
+                signed_delta, static_cast<unsigned>(strikes));
+
+            if (trigger && !m_failed.load(std::memory_order_acquire))
+            {
+                const std::string reason =
+                    "检测到玩家 P" + std::to_string(player_id) +
+                    " 已不同步：同一输入检查点的 VSync 连续偏移。游戏已自动暂停，请重新同步启动。";
+                BroadcastSessionAbort(reason);
+                Fail(reason.c_str());
+            }
+        }
+
         void LogStall(std::uint32_t frame, long long wait_ms)
         {
             const std::uint32_t wait = static_cast<std::uint32_t>(std::max<long long>(0, wait_ms));
@@ -2303,6 +2432,8 @@ namespace
                         Fail(reason.c_str());
                         return false;
                     }
+                    if ((source_frame % LOG_FRAME_INTERVAL) == 0)
+                        RecordHostSyncCheckpoint(source_frame, static_cast<std::uint64_t>(g_FrameCount));
                     BroadcastBundle(source_frame, bundle);
                 }
                 else if (!WaitForBundle(source_frame, &bundle))
@@ -2315,10 +2446,15 @@ namespace
                 }
                 m_output_bundle = bundle;
                 if ((source_frame % LOG_FRAME_INTERVAL) == 0)
+                {
+                    const std::uint64_t vsync = static_cast<std::uint64_t>(g_FrameCount);
                     Log("SYNC poll=%u vsync=%llu delay=%u players=%u wait_ms=%u",
-                        static_cast<unsigned>(source_frame), static_cast<unsigned long long>(g_FrameCount),
+                        static_cast<unsigned>(source_frame), static_cast<unsigned long long>(vsync),
                         static_cast<unsigned>(delay), static_cast<unsigned>(m_max_players),
                         static_cast<unsigned>(m_last_wait_ms.load(std::memory_order_acquire)));
+                    if (m_role == Role::Client)
+                        SendClientSyncCheckpoint(source_frame, vsync);
+                }
             }
             PruneInputHistory();
             return true;
@@ -2613,6 +2749,9 @@ namespace
                     MaybeCommitRuntimeConfig();
                     break;
                 }
+                case ControlType::SyncCheckpoint:
+                    HandlePeerSyncCheckpoint(peer.player_id, payload);
+                    break;
                 default:
                     break;
             }
@@ -2765,6 +2904,8 @@ namespace
         InputBundle m_output_bundle = {NEUTRAL_FRAME, NEUTRAL_FRAME, NEUTRAL_FRAME, NEUTRAL_FRAME};
         std::array<std::unordered_map<std::uint32_t, InputFrame>, MAX_PLAYERS> m_player_inputs;
         std::unordered_map<std::uint32_t, InputBundle> m_bundles;
+        std::unordered_map<std::uint32_t, std::uint64_t> m_host_sync_checkpoints;
+        std::array<std::uint32_t, MAX_PLAYERS> m_desync_strikes{};
 
         bool m_winsock_started = false;
         std::atomic<SOCKET> m_listener{INVALID_SOCKET};
