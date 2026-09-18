@@ -65,6 +65,9 @@ namespace ModernNetplay
         bool first_poll_released = false;
     };
 
+    // True for binaries produced by this Modern Netplay build pipeline.
+    // Used to prevent the stock PCSX2 updater from overwriting the Netplay build.
+    bool IsCustomBuild();
     bool IsConfigured();
     void StartSessionAsync();
     // Rebuild only the Netplay backend from the current environment settings.

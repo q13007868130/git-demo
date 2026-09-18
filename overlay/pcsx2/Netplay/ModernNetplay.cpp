@@ -7,6 +7,7 @@
 #include "Counters.h"
 #include "GameList.h"
 #include "Host.h"
+#include "VMManager.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
 #include "SIO/Memcard/MemoryCardFile.h"
@@ -91,6 +92,7 @@ namespace
         StartCommit = 10,
         FirstPollReady = 11,
         FirstPollGo = 12,
+        SessionAbort = 13,
     };
 
     struct PlayerState
@@ -1783,6 +1785,38 @@ namespace
             m_last_logged_local_input = input;
         }
 
+        void BroadcastSessionAbort(const std::string& reason)
+        {
+            if (m_role != Role::Host)
+                return;
+
+            const std::size_t size = std::min<std::size_t>(reason.size(), MAX_CONTROL_PAYLOAD);
+            BroadcastControl(ControlType::SessionAbort,
+                size > 0 ? reinterpret_cast<const std::uint8_t*>(reason.data()) : nullptr,
+                size);
+            Log("SESSION_ABORT broadcast: %s", reason.c_str());
+        }
+
+        void NotifyFatalSessionFailure(const std::string& reason)
+        {
+            if (!VMManager::HasValidVM())
+                return;
+
+            const std::string message =
+                "检测到联机连接或同步异常，当前游戏已暂停。\n\n原因：" + reason +
+                "\n\n请不要继续单独推进游戏。建议所有玩家回到联机大厅重新连接；如问题重复出现，请导出诊断包。";
+
+            Host::RunOnCPUThread([message]() {
+                if (VMManager::HasValidVM())
+                {
+                    VMManager::SetState(VMState::Paused);
+                    Host::AddKeyedOSDMessage("ModernNetplayDisconnected",
+                        "联机已中断，游戏已暂停。", Host::OSD_CRITICAL_ERROR_DURATION);
+                }
+            });
+            Host::ReportErrorAsync("PCSX2 联机已中断", message);
+        }
+
         bool SendInputToHost(std::uint32_t frame, const InputFrame& input)
         {
             std::array<std::uint8_t, INPUT_PACKET_SIZE> packet{};
@@ -1913,14 +1947,19 @@ namespace
                 {
                     if (!WaitForHostInputs(source_frame, &bundle))
                     {
-                        Fail("timed out waiting for room controller inputs");
+                        const std::string reason = "等待房间玩家输入超时，联机无法继续保持同步";
+                        BroadcastSessionAbort(reason);
+                        Fail(reason.c_str());
                         return false;
                     }
                     BroadcastBundle(source_frame, bundle);
                 }
                 else if (!WaitForBundle(source_frame, &bundle))
                 {
-                    Fail("timed out waiting for authoritative input bundle");
+                    const std::string reason = "客户端等待房主权威输入包超时，联机无法继续保持同步";
+                    SendControlToHost(ControlType::SessionAbort,
+                        reinterpret_cast<const std::uint8_t*>(reason.data()), reason.size());
+                    Fail(reason.c_str());
                     return false;
                 }
                 m_output_bundle = bundle;
@@ -2006,13 +2045,14 @@ namespace
             }
 
             peer->connected.store(false, std::memory_order_release);
+            const std::uint32_t dropped_player_id = peer->player_id;
             bool fatal_disconnect = false;
             bool cancelled_pending_start = false;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 fatal_disconnect = m_prepare_boot || m_start_committed;
-                if (peer->player_id >= 1 && peer->player_id <= MAX_PLAYERS)
-                    m_players[peer->player_id - 1] = PlayerState{};
+                if (dropped_player_id >= 1 && dropped_player_id <= MAX_PLAYERS)
+                    m_players[dropped_player_id - 1] = PlayerState{};
 
                 if (!fatal_disconnect && m_start_requested)
                 {
@@ -2021,12 +2061,17 @@ namespace
                     cancelled_pending_start = true;
                 }
             }
-            Log("P%u disconnected", static_cast<unsigned>(peer->player_id));
+            Log("P%u disconnected", static_cast<unsigned>(dropped_player_id));
             if (cancelled_pending_start)
                 Log("pending synchronized start cancelled; room remains reusable");
             BroadcastRoster();
             if (!m_stop_requested.load(std::memory_order_acquire) && fatal_disconnect)
-                Fail("player disconnected during synchronized session");
+            {
+                const std::string reason = "P" + std::to_string(dropped_player_id) +
+                    " 已掉线或关闭联机，所有玩家必须停止本局以避免不同步";
+                BroadcastSessionAbort(reason);
+                Fail(reason.c_str());
+            }
         }
 
         void ClientReceiverLoop(SOCKET socket)
@@ -2170,6 +2215,17 @@ namespace
                     MaybeReleaseFirstPoll();
                     break;
                 }
+                case ControlType::SessionAbort:
+                {
+                    const std::string reason(payload.empty() ?
+                        ("P" + std::to_string(peer.player_id) + " 请求终止本次联机") :
+                        std::string(reinterpret_cast<const char*>(payload.data()), payload.size()));
+                    Log("P%u requested SESSION_ABORT: %s",
+                        static_cast<unsigned>(peer.player_id), reason.c_str());
+                    BroadcastSessionAbort(reason);
+                    Fail(reason.c_str());
+                    break;
+                }
                 default:
                     break;
             }
@@ -2217,6 +2273,14 @@ namespace
                     m_first_poll_cv.notify_all();
                     break;
                 }
+                case ControlType::SessionAbort:
+                {
+                    const std::string reason(payload.empty() ? "房主终止了本次联机" :
+                        std::string(reinterpret_cast<const char*>(payload.data()), payload.size()));
+                    Log("SESSION_ABORT received: %s", reason.c_str());
+                    Fail(reason.c_str());
+                    break;
+                }
                 default:
                     break;
             }
@@ -2225,8 +2289,12 @@ namespace
         void Fail(const char* message)
         {
             SetLastError(message);
-            if (!m_failed.exchange(true, std::memory_order_acq_rel))
+            const bool first_failure = !m_failed.exchange(true, std::memory_order_acq_rel);
+            if (first_failure)
+            {
                 Log("ERROR: %s", message);
+                NotifyFatalSessionFailure(message);
+            }
             m_connected.store(false, std::memory_order_release);
             m_connecting.store(false, std::memory_order_release);
             m_running.store(false, std::memory_order_release);
@@ -2344,6 +2412,7 @@ namespace
     }
 } // namespace
 
+bool IsCustomBuild() { return true; }
 bool IsConfigured() { return GetSession().IsConfigured(); }
 void StartSessionAsync() { GetSession().StartSessionAsync(); }
 bool RestartSession() { return RestartSessionImpl(); }
@@ -2367,6 +2436,7 @@ std::uint8_t HandlePadResponse(std::uint8_t slot, std::uint32_t index, std::uint
 }
 void Shutdown() { GetSession().Stop(); }
 #else
+bool IsCustomBuild() { return true; }
 bool IsConfigured() { return false; }
 void StartSessionAsync() {}
 bool RestartSession() { return false; }

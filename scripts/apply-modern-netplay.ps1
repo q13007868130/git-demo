@@ -26,6 +26,7 @@ $ds2Cpp     = Join-Path $SourceRoot 'pcsx2\SIO\Pad\PadDualshock2.cpp'
 $coreCmake  = Join-Path $SourceRoot 'pcsx2\CMakeLists.txt'
 $vmManager  = Join-Path $SourceRoot 'pcsx2\VMManager.cpp'
 $mainWindow = Join-Path $SourceRoot 'pcsx2-qt\MainWindow.cpp'
+$autoUpdater = Join-Path $SourceRoot 'pcsx2-qt\AutoUpdaterDialog.cpp'
 $qtHost     = Join-Path $SourceRoot 'pcsx2-qt\QtHost.cpp'
 $qtCmake    = Join-Path $SourceRoot 'pcsx2-qt\CMakeLists.txt'
 
@@ -117,7 +118,7 @@ if ($text -notmatch '#include "NetplayDialog.h"') {
 }
 if ($text -notmatch '#include <QtCore/QTimer>') {
     $needle = '#include "NetplayDialog.h"'
-    $text = $text.Replace($needle, "$needle`r`n#include <QtCore/QTimer>")
+    $text = $text.Replace($needle, "$needle`r`n#include <QtCore/QTimer>`r`n#include <QtCore/QProcess>`r`n#include <QtCore/QFileInfo>`r`n#include <QtCore/QCoreApplication>")
 }
 if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
     $needle = "`tsetupStatusBarWidgets();"
@@ -133,6 +134,32 @@ if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
 		dialog.exec();
 	});
 
+	netplay_menu->addSeparator();
+	QAction* netplay_update = netplay_menu->addAction(tr("检查联机版更新..."));
+	connect(netplay_update, &QAction::triggered, this, [this]() {
+		if (QtHost::IsVMValid())
+		{
+			QMessageBox::information(this, tr("联机版更新"),
+				tr("请先停止当前游戏，再进行联机版更新。记忆卡、BIOS、游戏和个人配置不会被删除。"));
+			return;
+		}
+		const QString updater = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("Update-Netplay.bat"));
+		if (!QFileInfo::exists(updater))
+		{
+			QMessageBox::warning(this, tr("联机版更新"),
+				tr("当前版本缺少联机更新器，请先手工下载一次新版完整包。"));
+			return;
+		}
+		const QStringList args = {QStringLiteral("/c"), updater,
+			QString::number(QCoreApplication::applicationPid())};
+		if (!QProcess::startDetached(QStringLiteral("cmd.exe"), args, QCoreApplication::applicationDirPath()))
+			QMessageBox::critical(this, tr("联机版更新"), tr("无法启动联机版更新器。"));
+	});
+
+	QAction* upstream_update = netplay_menu->addAction(tr("检查 PCSX2 官方更新（仅查看）..."));
+	connect(upstream_update, &QAction::triggered, this, [this]() { checkForUpdates(true, true); });
+	m_ui.actionCheckForUpdates->setText(tr("检查 PCSX2 官方更新（仅查看）..."));
+
 	if (qEnvironmentVariableIsSet("PCSX2_NETPLAY_SHOW_LOBBY"))
 	{
 		QTimer::singleShot(250, this, [this]() {
@@ -144,6 +171,34 @@ if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
     $text = $text.Replace($needle, $needle + $menuCode)
 }
 Write-Text $mainWindow $text
+
+# Protect the custom Netplay binary from the stock PCSX2 installer.
+# Official update checks remain available for information, but clicking
+# "Download and Install" cannot overwrite the custom Netplay executable.
+$text = Read-Text $autoUpdater
+if ($text -notmatch '#include "Netplay/ModernNetplay.h"') {
+    $needle = '#include "AutoUpdaterDialog.h"'
+    if (-not $text.Contains($needle)) { throw 'AutoUpdaterDialog.cpp include anchor not found' }
+    $text = $text.Replace($needle, "$needle`r`n#include `"Netplay/ModernNetplay.h`"")
+}
+if ($text -notmatch 'PCSX2_MODERN_NETPLAY_OFFICIAL_UPDATE_GUARD') {
+    $needle = "void AutoUpdaterDialog::downloadUpdateClicked()`r`n{"
+    if (-not $text.Contains($needle)) { $needle = "void AutoUpdaterDialog::downloadUpdateClicked()`n{" }
+    if (-not $text.Contains($needle)) { throw 'AutoUpdaterDialog.cpp downloadUpdateClicked anchor not found' }
+    $guard = @'
+	// PCSX2_MODERN_NETPLAY_OFFICIAL_UPDATE_GUARD
+	if (ModernNetplay::IsCustomBuild())
+	{
+		QMessageBox::warning(this, tr("Modern Netplay"),
+			tr("当前是 Modern Netplay 修改版。直接安装 PCSX2 官方更新会覆盖联机功能。\n\n"
+			   "你仍可查看官方更新内容，但请使用“联机 → 检查联机版更新...”安装已经重新合并 Netplay 的版本。"));
+		return;
+	}
+
+'@
+    $text = $text.Replace($needle, $needle + "`r`n" + $guard)
+}
+Write-Text $autoUpdater $text
 
 # Only the synchronized room is allowed to start a VM. Once initialized, hold
 # every machine at BOOT_READY until all configured players arrive.

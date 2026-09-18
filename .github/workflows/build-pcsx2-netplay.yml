@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   windows-x64:
@@ -35,12 +35,12 @@ jobs:
           fetch-depth: 0
           path: src
 
-      - name: Record upstream revision
+      - name: Record build revisions
         shell: pwsh
-        working-directory: src
         run: |
-          git rev-parse HEAD | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_SHA.txt
-          git describe --tags --always | Tee-Object -FilePath ..\control\PCSX2_UPSTREAM_VERSION.txt
+          git -C src rev-parse HEAD | Tee-Object -FilePath control\PCSX2_UPSTREAM_SHA.txt
+          git -C src describe --tags --always | Tee-Object -FilePath control\PCSX2_UPSTREAM_VERSION.txt
+          git -C control rev-parse HEAD | Tee-Object -FilePath control\NETPLAY_CONTROL_SHA.txt
 
       - name: Apply Modern Netplay all-in-one multiplayer build
         shell: pwsh
@@ -52,7 +52,7 @@ jobs:
           Copy-Item control\overlay\pcsx2-qt\NetplayDialog.cpp src\pcsx2-qt\NetplayDialog.cpp -Force
           & control\scripts\apply-modern-netplay.ps1 -SourceRoot (Resolve-Path src)
           git -C src diff --check
-          git -C src diff -- pcsx2/SIO/Pad/Pad.cpp pcsx2/SIO/Pad/PadDualshock2.cpp pcsx2/VMManager.cpp pcsx2/CMakeLists.txt pcsx2-qt/MainWindow.cpp pcsx2-qt/QtHost.cpp pcsx2-qt/CMakeLists.txt
+          git -C src diff -- pcsx2/SIO/Pad/Pad.cpp pcsx2/SIO/Pad/PadDualshock2.cpp pcsx2/VMManager.cpp pcsx2/CMakeLists.txt pcsx2-qt/MainWindow.cpp pcsx2-qt/AutoUpdaterDialog.cpp pcsx2-qt/QtHost.cpp pcsx2-qt/CMakeLists.txt
 
       - name: Restore PCSX2 Windows dependencies
         id: cache-deps
@@ -100,8 +100,14 @@ jobs:
           Copy-Item control\PCSX2_UPSTREAM_VERSION.txt src\bin\PCSX2_UPSTREAM_VERSION.txt -Force
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.ps1 src\bin\Collect-Netplay-Diagnostics.ps1 -Force
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.bat src\bin\Collect-Netplay-Diagnostics.bat -Force
+          Copy-Item control\NETPLAY_CONTROL_SHA.txt src\bin\NETPLAY_CONTROL_SHA.txt -Force
+          $updaterText = Get-Content control\scripts\Update-Netplay.ps1 -Raw
+          $updaterText | Set-Content -Encoding utf8BOM src\bin\Update-Netplay.ps1
+          Copy-Item control\scripts\Update-Netplay.bat src\bin\Update-Netplay.bat -Force
+          $channel = if ($env:GITHUB_REF -eq "refs/heads/master") { "stable" } else { "test" }
+          $channel | Set-Content -Encoding ASCII src\bin\NETPLAY_UPDATE_CHANNEL.txt
           @"
-          PCSX2 Modern Netplay v0.5b-r4 full DualShock2 pressure sync
+          PCSX2 Modern Netplay v0.5b-r5 safe updater + disconnect alerts
           =================================================
           Base: current PCSX2 master at build time (exact SHA in PCSX2_UPSTREAM_SHA.txt)
           Protocol: v4 host-authoritative multiplayer + full 18-byte DualShock2 input + synchronized boot
@@ -109,6 +115,11 @@ jobs:
           Default port: 27886/TCP
 
           Included in this single test build:
+          - v0.5b-r5: if any player drops during a running session, all remaining players receive SESSION_ABORT, the VM is paused, and a Chinese disconnect/sync-error dialog is shown.
+          - v0.5b-r5: input/bundle synchronization timeouts also pause the game and show a visible warning instead of silently leaving machines diverged.
+          - v0.5b-r5: stock PCSX2 update checking remains available, but official "Download and Install" is blocked because it would overwrite Netplay.
+          - v0.5b-r5: new "联机 → 检查联机版更新..." downloads only our rolling Netplay package, rebuilt on top of current PCSX2 master.
+          - v0.5b-r5: updater overlays program-package files only and does not delete BIOS, memory cards, games, screenshots, saves, or user configuration.
           - v0.5b-r4: synchronize the complete 18-byte DualShock2 response, not only the legacy 6 bytes.
           - v0.5b-r4: adds the 12 pressure-sensitive button bytes (D-pad, face buttons, L1/R1/L2/R2); this targets games such as 爆走マウンテンバイカーズ which can use pressure values for menu/game transitions.
           - v0.5b-r4: protocol bumped to v4; all players must use the same r4 build.
@@ -183,7 +194,45 @@ jobs:
       - name: Upload Windows x64 Netplay build
         uses: actions/upload-artifact@v4
         with:
-          name: PCSX2-modern-netplay-windows-x64-v0.5b-r4
+          name: PCSX2-modern-netplay-windows-x64-v0.5b-r5
           path: src/bin
           if-no-files-found: error
           retention-days: 14
+
+      - name: Prepare rolling Netplay update package
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "PCSX2-modern-netplay-windows-x64.zip"
+          if (Test-Path $archive) { Remove-Item $archive -Force }
+          Compress-Archive -Path src\bin\* -DestinationPath $archive -CompressionLevel Optimal
+          $channel = if ($env:GITHUB_REF -eq "refs/heads/master") { "stable" } else { "test" }
+          $manifest = [ordered]@{
+            version = "v0.5b-r5"
+            channel = $channel
+            control_sha = (Get-Content control\NETPLAY_CONTROL_SHA.txt -Raw).Trim()
+            upstream_sha = (Get-Content control\PCSX2_UPSTREAM_SHA.txt -Raw).Trim()
+            sha256 = (Get-FileHash -Algorithm SHA256 $archive).Hash
+            asset_name = "PCSX2-modern-netplay-windows-x64.zip"
+            published_at = (Get-Date).ToUniversalTime().ToString("o")
+          }
+          $manifest | ConvertTo-Json | Set-Content -Encoding utf8 $env:RUNNER_TEMP\NETPLAY_UPDATE_MANIFEST.json
+
+      - name: Publish rolling Netplay update
+        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/feature/netplay-v0.5b-multiplayer-memcard-ui'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $channel = if ($env:GITHUB_REF -eq "refs/heads/master") { "stable" } else { "test" }
+          $tag = if ($channel -eq "stable") { "netplay-latest" } else { "netplay-test-latest" }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release delete $tag --cleanup-tag -y
+          }
+          $upstream = (Get-Content control\PCSX2_UPSTREAM_SHA.txt -Raw).Trim()
+          $notes = "Modern Netplay rolling $channel update.\n\nControl-SHA: $env:GITHUB_SHA\nUpstream-SHA: $upstream"
+          if ($channel -eq "test") {
+            gh release create $tag "$env:RUNNER_TEMP\PCSX2-modern-netplay-windows-x64.zip" "$env:RUNNER_TEMP\NETPLAY_UPDATE_MANIFEST.json" --target "$env:GITHUB_SHA" --title "PCSX2 Modern Netplay Test Update" --notes $notes --prerelease
+          } else {
+            gh release create $tag "$env:RUNNER_TEMP\PCSX2-modern-netplay-windows-x64.zip" "$env:RUNNER_TEMP\NETPLAY_UPDATE_MANIFEST.json" --target "$env:GITHUB_SHA" --title "PCSX2 Modern Netplay Latest" --notes $notes
+          }
