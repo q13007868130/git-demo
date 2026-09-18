@@ -490,6 +490,15 @@ namespace
         {
             if (!IsConfigured())
                 return false;
+
+            // 1P/2P always use the two normal physical controller ports.
+            if (m_max_players <= 2)
+            {
+                if (slot == 0) return m_max_players >= 1;
+                if (slot == 1) return m_max_players >= 2;
+                return false;
+            }
+
             const std::uint32_t topology = m_topology_mode.load(std::memory_order_acquire);
             if (topology == 0)
             {
@@ -865,6 +874,14 @@ namespace
 
         int SlotToPlayerIndex(std::uint32_t slot) const
         {
+            // Never disturb the proven 1P/2P layout.
+            if (m_max_players <= 2)
+            {
+                if (slot == 0) return 0;
+                if (m_max_players >= 2 && slot == 1) return 1;
+                return -1;
+            }
+
             const std::uint32_t topology = m_topology_mode.load(std::memory_order_acquire);
             if (topology == 0)
             {
@@ -2030,7 +2047,6 @@ namespace
                 m_runtime_reconfiguring = true;
                 m_runtime_change_id = change_id;
                 m_runtime_acks.fill(false);
-                m_runtime_acks[0] = true;
             }
             const auto payload = BuildRuntimeConfig(change_id, delay, topology, controllers);
             BroadcastControl(ControlType::RuntimeApply, payload.data(), static_cast<std::uint32_t>(payload.size()));
@@ -2038,6 +2054,11 @@ namespace
             {
                 Fail("failed to apply host runtime Netplay configuration");
                 return false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (m_runtime_reconfiguring && m_runtime_change_id == change_id)
+                    m_runtime_acks[0] = true;
             }
             BroadcastRoster();
             MaybeCommitRuntimeConfig();

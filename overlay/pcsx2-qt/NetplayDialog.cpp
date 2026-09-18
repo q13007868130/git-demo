@@ -536,7 +536,7 @@ void NetplayDialog::refreshLobby()
     if (m_topology_mode && !m_topology_mode->hasFocus())
         m_topology_mode->setCurrentIndex(status.topology_mode == 0 ? 0 : 1);
     m_runtime_delay->setEnabled(is_host && !status.runtime_reconfiguring);
-    m_topology_mode->setEnabled(is_host && !status.runtime_reconfiguring);
+    m_topology_mode->setEnabled(is_host && status.max_players >= 3 && !status.runtime_reconfiguring);
     m_local_controller->setEnabled(!status.runtime_reconfiguring);
     m_apply_runtime->setEnabled(!status.runtime_reconfiguring);
 
