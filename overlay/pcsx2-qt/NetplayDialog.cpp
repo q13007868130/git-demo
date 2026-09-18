@@ -698,6 +698,12 @@ void NetplayDialog::refreshLobby()
     m_runtime_delay->setEnabled(is_host && !status.runtime_reconfiguring);
     m_runtime_players->setEnabled(is_host && status.max_players < ModernNetplay::MAX_PLAYERS && !status.runtime_reconfiguring);
     m_topology_mode->setEnabled(is_host && status.round_players >= 3 && !vm_active && !status.runtime_reconfiguring);
+    if (!is_host)
+        m_topology_mode->setToolTip(tr("这是整个房间共用的 Multitap 硬件布局，仅房主可以修改。"));
+    else if (vm_active)
+        m_topology_mode->setToolTip(tr("多人手柄布局会改变虚拟 PS2 硬件，游戏运行中不能修改；请切换游戏后调整。"));
+    else
+        m_topology_mode->setToolTip(QString());
 
     const bool controller_swapping_allowed = (status.round_players >= 3);
     m_local_controller->setEnabled(controller_swapping_allowed && !status.runtime_reconfiguring);
