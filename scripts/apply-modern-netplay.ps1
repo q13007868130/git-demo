@@ -49,12 +49,9 @@ if ($text.Contains($oldController)) {
     throw 'Pad.cpp controller-type anchor not found'
 }
 
-if ($text -notmatch 'ModernNetplay::Shutdown\(\)') {
-    $shutdownAnchor = "void Pad::Shutdown()`r`n{"
-    if (-not $text.Contains($shutdownAnchor)) { $shutdownAnchor = "void Pad::Shutdown()`n{" }
-    if (-not $text.Contains($shutdownAnchor)) { throw 'Pad.cpp Shutdown anchor not found' }
-    $text = $text.Replace($shutdownAnchor, "$shutdownAnchor`r`n`tModernNetplay::Shutdown();")
-}
+# Netplay room lifetime intentionally outlives a single VM run.
+# Do not terminate the network backend from Pad::Shutdown(); otherwise a failed
+# or completed game makes the lobby unrecoverable until PCSX2 itself restarts.
 Write-Text $padCpp $text
 
 # Intercept the legacy-compatible six DualShock2 response bytes.

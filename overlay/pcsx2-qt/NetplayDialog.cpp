@@ -266,10 +266,12 @@ void NetplayDialog::buildLobbyUi()
     auto* buttons = new QHBoxLayout();
     auto* log_button = new QPushButton(tr("打开日志"), this);
     auto* diag_button = new QPushButton(tr("导出诊断包"), this);
+    auto* retry_button = new QPushButton(tr("重建连接"), this);
     m_start_game = new QPushButton(tr("选择游戏并开始..."), this);
     auto* leave_button = new QPushButton(tr("退出联机"), this);
     buttons->addWidget(log_button);
     buttons->addWidget(diag_button);
+    buttons->addWidget(retry_button);
     buttons->addStretch(1);
     buttons->addWidget(m_start_game);
     buttons->addWidget(leave_button);
@@ -277,10 +279,24 @@ void NetplayDialog::buildLobbyUi()
 
     connect(log_button, &QPushButton::clicked, this, [this]() { openLogFolder(); });
     connect(diag_button, &QPushButton::clicked, this, [this]() { exportDiagnostics(); });
+    connect(retry_button, &QPushButton::clicked, this, [this]() {
+        if (QtHost::IsVMValid())
+        {
+            QMessageBox::information(this, tr("联机"), tr("请先停止当前游戏，再重建联机连接。"));
+            return;
+        }
+        if (!ModernNetplay::RestartSession())
+            QMessageBox::warning(this, tr("联机"), tr("无法重建联机连接。"));
+        refreshLobby();
+    });
     connect(m_start_game, &QPushButton::clicked, this, [this]() { chooseGameAndStart(); });
     connect(leave_button, &QPushButton::clicked, this, [this]() { launchNormalInstance(); });
 
-    ModernNetplay::StartSessionAsync();
+    const ModernNetplay::StatusSnapshot initial_status = ModernNetplay::GetStatusSnapshot();
+    if (!QtHost::IsVMValid() && (initial_status.failed || initial_status.start_committed))
+        ModernNetplay::RestartSession();
+    else
+        ModernNetplay::StartSessionAsync();
     auto* timer = new QTimer(this);
     connect(timer, &QTimer::timeout, this, [this]() { refreshLobby(); });
     timer->start(200);
@@ -390,7 +406,9 @@ void NetplayDialog::refreshLobby()
     const bool is_host = (status.role == "host");
 
     if (status.failed)
-        m_room_status->setText(tr("连接错误：%1").arg(QString::fromStdString(status.last_error)));
+        m_room_status->setText(tr("连接错误：%1 · 可点击“重建连接”恢复，无需重启 PCSX2").arg(QString::fromStdString(status.last_error)));
+    else if (!status.last_error.empty() && !status.start_requested)
+        m_room_status->setText(tr("%1 · 房间仍可继续使用").arg(QString::fromStdString(status.last_error)));
     else if (status.room_full)
         m_room_status->setText(tr("房间已就绪 · %1 / %2 人 · 输入延迟 %3 帧").arg(status.player_count).arg(status.max_players).arg(status.delay));
     else if (is_host)

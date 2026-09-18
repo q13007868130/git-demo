@@ -67,6 +67,9 @@ namespace ModernNetplay
 
     bool IsConfigured();
     void StartSessionAsync();
+    // Rebuild only the Netplay backend from the current environment settings.
+    // This makes a failed/disconnected lobby reusable without restarting PCSX2.
+    bool RestartSession();
     StatusSnapshot GetStatusSnapshot();
 
     bool HostSelectGame(const std::string& path, const std::string& title,

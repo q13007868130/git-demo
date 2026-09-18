@@ -6,6 +6,7 @@
 #include "Config.h"
 #include "Counters.h"
 #include "GameList.h"
+#include "Host.h"
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Memcard/MemoryCardFolder.h"
 
@@ -24,6 +25,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -163,6 +165,67 @@ namespace
         return true;
     }
 
+    bool ConnectWithTimeout(SOCKET socket, const sockaddr* address, int address_length, int timeout_ms)
+    {
+        u_long nonblocking = 1;
+        if (ioctlsocket(socket, FIONBIO, &nonblocking) != 0)
+            return false;
+
+        int result = connect(socket, address, address_length);
+        if (result == SOCKET_ERROR)
+        {
+            const int error = WSAGetLastError();
+            if (error != WSAEWOULDBLOCK && error != WSAEINPROGRESS && error != WSAEINVAL)
+            {
+                nonblocking = 0;
+                ioctlsocket(socket, FIONBIO, &nonblocking);
+                return false;
+            }
+
+            fd_set write_set;
+            fd_set error_set;
+            FD_ZERO(&write_set);
+            FD_ZERO(&error_set);
+            FD_SET(socket, &write_set);
+            FD_SET(socket, &error_set);
+            timeval timeout{};
+            timeout.tv_sec = timeout_ms / 1000;
+            timeout.tv_usec = (timeout_ms % 1000) * 1000;
+            result = select(0, nullptr, &write_set, &error_set, &timeout);
+            if (result <= 0 || FD_ISSET(socket, &error_set))
+            {
+                nonblocking = 0;
+                ioctlsocket(socket, FIONBIO, &nonblocking);
+                return false;
+            }
+
+            int socket_error = 0;
+            int socket_error_size = sizeof(socket_error);
+            if (getsockopt(socket, SOL_SOCKET, SO_ERROR,
+                    reinterpret_cast<char*>(&socket_error), &socket_error_size) != 0 ||
+                socket_error != 0)
+            {
+                nonblocking = 0;
+                ioctlsocket(socket, FIONBIO, &nonblocking);
+                return false;
+            }
+        }
+
+        nonblocking = 0;
+        return ioctlsocket(socket, FIONBIO, &nonblocking) == 0;
+    }
+
+    std::string TruncateUtf8(const std::string& value, std::size_t max_bytes)
+    {
+        if (value.size() <= max_bytes)
+            return value;
+
+        std::size_t cut = max_bytes;
+        while (cut > 0 && (static_cast<unsigned char>(value[cut]) & 0xC0u) == 0x80u)
+            --cut;
+        return value.substr(0, cut);
+    }
+
     class Session final
     {
     public:
@@ -296,6 +359,7 @@ namespace
                 m_game_serial = serial;
                 m_game_crc = crc;
                 m_local_game_path = path;
+                m_last_error.clear();
                 ResetStartStateLocked();
                 for (std::uint32_t i = 0; i < m_max_players; i++)
                     m_players[i].game_match = (i == 0);
@@ -535,6 +599,21 @@ namespace
                 m_winsock_started = false;
             }
 
+            std::string shadow_to_remove;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                shadow_to_remove = m_shadow_card_filename;
+                m_shadow_card_filename.clear();
+            }
+            if (!shadow_to_remove.empty())
+            {
+                std::error_code remove_error;
+                std::filesystem::remove(
+                    std::filesystem::path(EmuFolders::MemoryCards) / shadow_to_remove, remove_error);
+                Log("removed Netplay shadow card: %s%s", shadow_to_remove.c_str(),
+                    remove_error ? " (cleanup warning)" : "");
+            }
+
             Log("session stopped");
             CloseLog();
         }
@@ -567,8 +646,7 @@ namespace
                 m_username = username;
             if (m_username.empty())
                 m_username = (m_role == Role::Host) ? "房主" : "玩家";
-            if (m_username.size() > 38)
-                m_username.resize(38);
+            m_username = TruncateUtf8(m_username, 35);
 
             if (const char* host = std::getenv("PCSX2_NETPLAY_HOST"))
                 m_host = host;
@@ -857,6 +935,7 @@ namespace
                 m_players[0].name = host_name.empty() ? "房主" : host_name;
                 m_players[assigned - 1].connected = true;
                 m_players[assigned - 1].name = m_username;
+                m_last_error.clear();
             }
             m_delay.store(std::clamp<std::uint32_t>(delay, 1, 12), std::memory_order_release);
             return true;
@@ -942,6 +1021,7 @@ namespace
                 }
                 {
                     std::lock_guard<std::mutex> lock(m_state_mutex);
+                    m_players[player_id - 1] = PlayerState{};
                     m_players[player_id - 1].connected = true;
                     m_players[player_id - 1].name = player_name;
                 }
@@ -979,7 +1059,8 @@ namespace
                         SOCKET candidate = socket(current->ai_family, current->ai_socktype, current->ai_protocol);
                         if (candidate == INVALID_SOCKET)
                             continue;
-                        if (connect(candidate, current->ai_addr, static_cast<int>(current->ai_addrlen)) != SOCKET_ERROR)
+                        if (ConnectWithTimeout(candidate, current->ai_addr,
+                                static_cast<int>(current->ai_addrlen), 900))
                         {
                             connected = candidate;
                             break;
@@ -1004,7 +1085,39 @@ namespace
                                 static_cast<unsigned>(m_local_player_id), static_cast<unsigned>(m_max_players),
                                 static_cast<unsigned>(m_delay.load()), static_cast<unsigned long long>(m_session_id));
                             ClientReceiverLoop(connected);
-                            return;
+
+                            {
+                                std::lock_guard<std::mutex> lock(m_client_socket_mutex);
+                                if (m_client_socket == connected)
+                                    m_client_socket = INVALID_SOCKET;
+                            }
+                            shutdown(connected, SD_BOTH);
+                            closesocket(connected);
+                            m_connected.store(false, std::memory_order_release);
+                            m_running.store(false, std::memory_order_release);
+
+                            if (m_stop_requested.load(std::memory_order_acquire) ||
+                                m_failed.load(std::memory_order_acquire))
+                                return;
+
+                            {
+                                std::lock_guard<std::mutex> lock(m_state_mutex);
+                                m_local_player_id = 0;
+                                m_session_id = 0;
+                                m_players = {};
+                                m_players[0].name = "房主";
+                                m_game_selected = false;
+                                m_local_game_match = false;
+                                m_game_title.clear();
+                                m_game_serial.clear();
+                                m_game_crc = 0;
+                                m_local_game_path.clear();
+                                ResetStartStateLocked();
+                            }
+                            m_connecting.store(true, std::memory_order_release);
+                            Log("connection returned to lobby; retrying host automatically");
+                            std::this_thread::sleep_for(std::chrono::milliseconds(350));
+                            continue;
                         }
                         closesocket(connected);
                     }
@@ -1175,6 +1288,7 @@ namespace
                 m_game_crc = crc;
                 m_local_game_path = local_path;
                 m_local_game_match = matched;
+                m_last_error.clear();
                 ResetStartStateLocked();
                 if (m_local_player_id >= 1 && m_local_player_id <= MAX_PLAYERS)
                     m_players[m_local_player_id - 1].game_match = matched;
@@ -1192,17 +1306,51 @@ namespace
         {
             data->clear();
             *present = false;
-            const Pcsx2Config::McdOptions config = EmuConfig.Mcd[0];
-            if (!config.Enabled || config.Type == MemoryCardType::Empty)
-                return true;
 
-            const std::string path = EmuConfig.FullpathToMcd(0);
-            if (config.Type == MemoryCardType::File)
+            // The Netplay lobby runs before VM settings/type auto-detection.
+            // Read the actual base Slot 1 selection and inspect the filesystem
+            // instead of trusting the pre-VM EmuConfig.Mcd[0].Type value.
+            const bool enabled = Host::GetBaseBoolSettingValue("MemoryCards", "Slot1_Enable", true);
+            const std::string filename = Host::GetBaseStringSettingValue(
+                "MemoryCards", "Slot1_Filename", FileMcd_GetDefaultName(0).c_str());
+
+            if (!enabled || filename.empty())
             {
-                std::ifstream file(path, std::ios::binary | std::ios::ate);
+                Log("memory card source: slot1 disabled/empty; synchronizing no-card state");
+                return true;
+            }
+
+            std::optional<AvailableMcdInfo> info = FileMcd_GetCardInfo(filename);
+            if (!info.has_value())
+            {
+                // PCSX2 normally auto-creates a missing enabled file card when a
+                // VM opens. Netplay must export before boot, so create the same
+                // default 8 MB file card now and then export it.
+                Log("memory card source '%s' missing; creating default 8 MB card before sync", filename.c_str());
+                if (!FileMcd_CreateNewCard(filename, MemoryCardType::File, MemoryCardFileType::PS2_8MB))
+                {
+                    *error = "无法创建房主当前配置的 1 号记忆卡";
+                    return false;
+                }
+                info = FileMcd_GetCardInfo(filename);
+            }
+
+            if (!info.has_value())
+            {
+                *error = "无法解析房主当前配置的 1 号记忆卡";
+                return false;
+            }
+
+            Log("memory card source resolved: name=%s type=%s path=%s size=%u",
+                filename.c_str(), info->type == MemoryCardType::Folder ? "folder" : "file",
+                info->path.c_str(), static_cast<unsigned>(info->size));
+
+            if (info->type == MemoryCardType::File)
+            {
+                std::ifstream file(info->path, std::ios::binary | std::ios::ate);
                 if (!file)
                 {
-                    *error = "无法读取房主记忆卡文件";
+                    *error = "无法读取房主记忆卡文件：" + info->path;
                     return false;
                 }
                 const std::streamsize size = file.tellg();
@@ -1222,28 +1370,37 @@ namespace
                 return true;
             }
 
-            if (config.Type == MemoryCardType::Folder)
+            if (info->type == MemoryCardType::Folder)
             {
+                Pcsx2Config::McdOptions config{};
+                config.Enabled = true;
+                config.Type = MemoryCardType::Folder;
+                config.Filename = filename;
+
                 FolderMemoryCard card;
-                card.Open(path, config, 0, false, "");
+                card.Open(info->path, config, 0, false, "");
                 if (card.IsPresent() <= 0)
                 {
                     card.Close(false);
-                    *error = "无法打开房主文件夹记忆卡";
+                    *error = "无法打开房主文件夹记忆卡：" + info->path;
                     return false;
                 }
-                const std::size_t capacity = static_cast<std::size_t>(card.GetSizeInClusters()) * FolderMemoryCard::ClusterSizeRaw;
+
+                const std::size_t capacity =
+                    static_cast<std::size_t>(card.GetSizeInClusters()) * FolderMemoryCard::ClusterSizeRaw;
                 if (capacity == 0 || capacity > (80u * 1024u * 1024u))
                 {
                     card.Close(false);
                     *error = "房主文件夹记忆卡大小异常";
                     return false;
                 }
+
                 data->resize(capacity);
                 std::size_t address = 0;
                 while (address < capacity)
                 {
-                    const int size = static_cast<int>(std::min<std::size_t>(FolderMemoryCard::PageSizeRaw, capacity - address));
+                    const int size = static_cast<int>(
+                        std::min<std::size_t>(FolderMemoryCard::PageSizeRaw, capacity - address));
                     if (card.Read(data->data() + address, static_cast<u32>(address), size) < 0)
                     {
                         card.Close(false);
@@ -1283,6 +1440,18 @@ namespace
             return true;
         }
 
+        void CancelPendingStart(const std::string& message)
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                ResetStartStateLocked();
+                m_last_error = message;
+                m_memory_card_status = message;
+            }
+            Log("START_CANCELLED: %s", message.c_str());
+            BroadcastRoster();
+        }
+
         void StartHostMemoryCardSync()
         {
             std::vector<std::uint8_t> data;
@@ -1290,7 +1459,7 @@ namespace
             std::string error;
             if (!ExportConfiguredMemoryCard(&data, &present, &error))
             {
-                Fail(error.c_str());
+                CancelPendingStart(error);
                 return;
             }
 
@@ -1298,7 +1467,7 @@ namespace
             std::string shadow;
             if (!WriteShadowCard(data, present, &shadow))
             {
-                Fail("无法创建房主联机临时记忆卡");
+                CancelPendingStart("无法创建房主联机临时记忆卡");
                 return;
             }
 
@@ -1379,14 +1548,16 @@ namespace
             std::vector<std::uint8_t> data;
             bool present = false;
             std::uint64_t expected = 0;
+            std::uint64_t received = 0;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 data = m_memcard_receive;
                 present = m_memory_card_present;
                 expected = m_memory_card_crc;
+                received = m_memcard_received_bytes;
             }
             const std::uint64_t actual = present ? HashBytes(data) : 0;
-            bool ok = (actual == expected);
+            bool ok = (received == data.size()) && (actual == expected);
             std::string shadow;
             if (ok)
                 ok = WriteShadowCard(data, present, &shadow);
@@ -1408,7 +1579,10 @@ namespace
             Log("memory card receive complete: ok=%s size=%u hash=%016llX", ok ? "yes" : "no",
                 static_cast<unsigned>(data.size()), static_cast<unsigned long long>(actual));
             if (!ok)
-                Fail("memory card synchronization failed");
+            {
+                SetLastError("记忆卡同步失败，可在房间中重新选择游戏重试");
+                Log("memory card synchronization failed; lobby remains open for retry");
+            }
         }
 
         void MaybeAdvanceStart()
@@ -1795,14 +1969,26 @@ namespace
             }
 
             peer->connected.store(false, std::memory_order_release);
+            bool fatal_disconnect = false;
+            bool cancelled_pending_start = false;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
+                fatal_disconnect = m_prepare_boot || m_start_committed;
                 if (peer->player_id >= 1 && peer->player_id <= MAX_PLAYERS)
-                    m_players[peer->player_id - 1].connected = false;
+                    m_players[peer->player_id - 1] = PlayerState{};
+
+                if (!fatal_disconnect && m_start_requested)
+                {
+                    ResetStartStateLocked();
+                    m_last_error = "有玩家在启动前离开，本次启动已取消；房间仍保持开放";
+                    cancelled_pending_start = true;
+                }
             }
             Log("P%u disconnected", static_cast<unsigned>(peer->player_id));
+            if (cancelled_pending_start)
+                Log("pending synchronized start cancelled; room remains reusable");
             BroadcastRoster();
-            if (m_start_requested || m_prepare_boot || m_start_committed)
+            if (!m_stop_requested.load(std::memory_order_acquire) && fatal_disconnect)
                 Fail("player disconnected during synchronized session");
         }
 
@@ -1865,7 +2051,21 @@ namespace
             m_boot_cv.notify_all();
             m_first_poll_cv.notify_all();
             if (!m_stop_requested.load(std::memory_order_acquire) && !m_failed.load(std::memory_order_acquire))
-                Fail("host disconnected");
+            {
+                bool active_round = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_state_mutex);
+                    active_round = m_prepare_boot || m_start_committed;
+                }
+                if (active_round)
+                    Fail("host disconnected during synchronized session");
+                else
+                {
+                    SetLastError("与房主的连接中断，正在自动重新连接");
+                    Log("host disconnected before synchronized boot; reconnect will be attempted");
+                    m_connecting.store(true, std::memory_order_release);
+                }
+            }
         }
 
         void HandleHostControl(Peer& peer, ControlType type, const std::vector<std::uint8_t>& payload)
@@ -1895,12 +2095,19 @@ namespace
                         return;
                     const bool ok = ReadU32(payload.data()) != 0;
                     const std::uint64_t hash = ReadU64(payload.data() + 4);
+                    bool accepted = false;
                     {
                         std::lock_guard<std::mutex> lock(m_state_mutex);
-                        m_players[peer.player_id - 1].memcard_ready = ok && (hash == m_memory_card_crc);
+                        accepted = ok && (hash == m_memory_card_crc);
+                        m_players[peer.player_id - 1].memcard_ready = accepted;
                     }
                     Log("P%u MEMCARD_READY=%s hash=%016llX", static_cast<unsigned>(peer.player_id),
-                        ok ? "yes" : "no", static_cast<unsigned long long>(hash));
+                        accepted ? "yes" : "no", static_cast<unsigned long long>(hash));
+                    if (!accepted)
+                    {
+                        CancelPendingStart("有玩家的记忆卡同步校验失败，本次启动已取消，可直接重试");
+                        break;
+                    }
                     BroadcastRoster();
                     MaybeAdvanceStart();
                     break;
@@ -1982,7 +2189,7 @@ namespace
         {
             SetLastError(message);
             if (!m_failed.exchange(true, std::memory_order_acq_rel))
-                Log("ERROR: %s (WSA=%d)", message, WSAGetLastError());
+                Log("ERROR: %s", message);
             m_connected.store(false, std::memory_order_release);
             m_connecting.store(false, std::memory_order_release);
             m_running.store(false, std::memory_order_release);
@@ -2066,15 +2273,42 @@ namespace
         const std::chrono::steady_clock::time_point m_session_started = std::chrono::steady_clock::now();
     };
 
+    std::unique_ptr<Session>& GetSessionStorage()
+    {
+        static std::unique_ptr<Session> session = std::make_unique<Session>();
+        return session;
+    }
+
+    std::mutex& GetSessionLifecycleMutex()
+    {
+        static std::mutex mutex;
+        return mutex;
+    }
+
     Session& GetSession()
     {
-        static Session session;
-        return session;
+        std::unique_ptr<Session>& session = GetSessionStorage();
+        if (!session)
+            session = std::make_unique<Session>();
+        return *session;
+    }
+
+    bool RestartSessionImpl()
+    {
+        std::lock_guard<std::mutex> lock(GetSessionLifecycleMutex());
+        std::unique_ptr<Session>& session = GetSessionStorage();
+        session.reset();
+        session = std::make_unique<Session>();
+        if (!session->IsConfigured())
+            return false;
+        session->StartSessionAsync();
+        return true;
     }
 } // namespace
 
 bool IsConfigured() { return GetSession().IsConfigured(); }
 void StartSessionAsync() { GetSession().StartSessionAsync(); }
+bool RestartSession() { return RestartSessionImpl(); }
 StatusSnapshot GetStatusSnapshot() { return GetSession().GetStatusSnapshot(); }
 bool HostSelectGame(const std::string& path, const std::string& title, const std::string& serial, std::uint32_t crc)
 {
@@ -2097,6 +2331,7 @@ void Shutdown() { GetSession().Stop(); }
 #else
 bool IsConfigured() { return false; }
 void StartSessionAsync() {}
+bool RestartSession() { return false; }
 StatusSnapshot GetStatusSnapshot() { return {}; }
 bool HostSelectGame(const std::string&, const std::string&, const std::string&, std::uint32_t) { return false; }
 bool RequestSynchronizedBoot() { return false; }

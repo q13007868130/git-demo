@@ -101,7 +101,7 @@ jobs:
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.ps1 src\bin\Collect-Netplay-Diagnostics.ps1 -Force
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.bat src\bin\Collect-Netplay-Diagnostics.bat -Force
           @"
-          PCSX2 Modern Netplay v0.5b all-in-one test build
+          PCSX2 Modern Netplay v0.5b-r2 recovery + memory-card fix
           =================================================
           Base: current PCSX2 master at build time (exact SHA in PCSX2_UPSTREAM_SHA.txt)
           Protocol: v3 host-authoritative multiplayer + synchronized boot
@@ -109,6 +109,14 @@ jobs:
           Default port: 27886/TCP
 
           Included in this single test build:
+          - v0.5b-r2: fix real Slot 1 file/folder detection before VM boot.
+          - v0.5b-r2: memory-card errors cancel only the current Start attempt; the room remains reusable.
+          - v0.5b-r2: add “重建连接” and automatic failed-lobby recovery without restarting PCSX2.
+          - v0.5b-r2: client connect has a short timeout and automatically retries before synchronized boot.
+          - v0.5b-r2: pre-boot player disconnect frees its P-slot instead of poisoning the room.
+          - v0.5b-r2: VM/Pad shutdown no longer destroys the Netplay backend.
+          - v0.5b-r2: temporary Shadow cards are removed when the backend is rebuilt/stopped.
+          - v0.5b-r2: generic errors no longer display misleading stale WSA codes.
           - Compact Chinese setup UI: separate Create Room / Join Room tabs.
           - Dedicated Chinese lobby instead of one oversized all-in-one settings page.
           - Host chooses the game only after entering the room; selection opens a separate game-list dialog.
@@ -168,7 +176,7 @@ jobs:
       - name: Upload Windows x64 Netplay build
         uses: actions/upload-artifact@v4
         with:
-          name: PCSX2-modern-netplay-windows-x64-v0.5b-all-in-one
+          name: PCSX2-modern-netplay-windows-x64-v0.5b-r2
           path: src/bin
           if-no-files-found: error
           retention-days: 14
