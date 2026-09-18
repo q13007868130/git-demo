@@ -672,6 +672,12 @@ namespace
             CloseLog();
         }
 
+        bool RequestRuntimeSettingsImpl(std::uint32_t local_controller,
+            std::uint32_t delay, std::uint32_t topology)
+        {
+            return RequestRuntimeSettingsImpl(local_controller, delay, topology);
+        }
+
     private:
         const char* RoleName() const
         {
