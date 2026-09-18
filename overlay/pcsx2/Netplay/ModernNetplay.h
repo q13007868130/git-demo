@@ -31,6 +31,7 @@ namespace ModernNetplay
         bool room_full = false;
         std::uint32_t player_count = 0;
         std::uint32_t max_players = 2;
+        std::uint32_t round_players = 2;
         std::uint32_t local_player_id = 0;
         std::uint32_t delay = 2;
         std::uint16_t port = 27886;
@@ -67,6 +68,8 @@ namespace ModernNetplay
         bool all_boot_ready = false;
         bool start_committed = false;
         bool first_poll_released = false;
+        bool round_in_progress = false;
+        bool game_switching = false;
         std::uint32_t topology_mode = 1;
         bool runtime_reconfiguring = false;
         std::uint32_t input_epoch = 0;
@@ -95,6 +98,8 @@ namespace ModernNetplay
     // Delay/topology are host-authoritative and are locked once a VM is running.
     bool RequestRuntimeSettings(std::uint32_t local_controller,
         std::uint32_t delay, std::uint32_t topology_mode);
+    bool RequestRoomCapacity(std::uint32_t max_players);
+    bool RequestReturnToLobby();
 
     bool CanStartVM();
     bool ShouldHoldBootBarrier();

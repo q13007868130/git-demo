@@ -52,7 +52,7 @@ namespace
     constexpr std::uint32_t INPUT_MAGIC = 0x494E5054;   // INPT
     constexpr std::uint32_t BUNDLE_MAGIC = 0x424E444C;  // BNDL
     constexpr std::uint32_t CONTROL_MAGIC = 0x43544C31; // CTL1
-    constexpr std::uint32_t PROTOCOL_VERSION = 8;
+    constexpr std::uint32_t PROTOCOL_VERSION = 9;
     constexpr std::uint16_t DEFAULT_PORT = 27886;
     constexpr int RECEIVE_TIMEOUT_SECONDS = 30;
     constexpr int BOOT_BARRIER_TIMEOUT_SECONDS = 90;
@@ -102,6 +102,7 @@ namespace
         RuntimeCommit = 17,
         SyncCheckpoint = 18,
         MemcardAbort = 19,
+        RoundEnd = 20,
     };
 
     struct PlayerState
@@ -280,7 +281,7 @@ namespace
 
             OpenLog();
             Log("session configured: role=%s user=%s port=%u players=%u delay=%u memcard=%s protocol=%u",
-                RoleName(), m_username.c_str(), static_cast<unsigned>(m_port), static_cast<unsigned>(m_max_players),
+                RoleName(), m_username.c_str(), static_cast<unsigned>(m_port), static_cast<unsigned>(m_room_capacity),
                 static_cast<unsigned>(m_delay.load()), m_memory_card_sync_enabled ? "on" : "off",
                 static_cast<unsigned>(PROTOCOL_VERSION));
         }
@@ -311,8 +312,8 @@ namespace
             if (m_role == Role::Host)
             {
                 m_connected.store(true, std::memory_order_release);
-                m_connecting.store(m_max_players > 1, std::memory_order_release);
-                if (m_max_players > 1)
+                m_connecting.store(m_room_capacity > 1, std::memory_order_release);
+                if (m_room_capacity > 1)
                     m_connector = std::thread([this]() { AcceptLoop(); });
                 else
                     Log("single-player room ready");
@@ -337,13 +338,14 @@ namespace
             out.username = m_username;
 
             std::lock_guard<std::mutex> lock(m_state_mutex);
-            out.max_players = m_max_players;
+            out.max_players = m_room_capacity;
+            out.round_players = m_max_players;
             out.local_player_id = m_local_player_id;
             out.session_id = m_session_id;
             out.last_error = m_last_error;
             out.log_path = m_log_path;
-            out.player_count = ConnectedCountLocked();
-            out.room_full = (out.player_count == m_max_players);
+            out.player_count = RoomConnectedCountLocked();
+            out.room_full = (out.player_count == m_room_capacity);
             for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
             {
                 out.players[i].id = i + 1;
@@ -381,6 +383,8 @@ namespace
             out.all_boot_ready = AllBootReadyLocked();
             out.start_committed = m_start_committed;
             out.first_poll_released = m_first_poll_go;
+            out.round_in_progress = m_round_in_progress;
+            out.game_switching = m_game_switching;
             out.topology_mode = m_topology_mode.load(std::memory_order_acquire);
             out.runtime_reconfiguring = m_runtime_reconfiguring;
             out.input_epoch = m_input_epoch.load(std::memory_order_acquire);
@@ -390,14 +394,18 @@ namespace
         bool HostSelectGame(const std::string& path, const std::string& title,
             const std::string& serial, std::uint32_t crc)
         {
-            if (m_role != Role::Host || path.empty() || serial.empty() || crc == 0)
+            if (m_role != Role::Host || path.empty() || serial.empty() || crc == 0 ||
+                VMManager::HasValidVM())
                 return false;
 
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (m_prepare_boot || ConnectedCountLocked() != m_max_players)
+                if (m_prepare_boot || RoomConnectedCountLocked() != m_room_capacity)
                     return false;
 
+                m_max_players = m_room_capacity;
+                m_round_in_progress = false;
+                m_game_switching = false;
                 m_game_selected = true;
                 m_local_game_match = true;
                 m_game_title = title;
@@ -406,8 +414,8 @@ namespace
                 m_local_game_path = path;
                 m_last_error.clear();
                 ResetStartStateLocked();
-                for (std::uint32_t i = 0; i < m_max_players; i++)
-                    m_players[i].game_match = (i == 0);
+                for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                    m_players[i].game_match = (i == 0 && i < m_max_players);
             }
 
             Log("host selected game: title=%s serial=%s crc=%08X", title.c_str(), serial.c_str(), crc);
@@ -427,7 +435,7 @@ namespace
 
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (ConnectedCountLocked() != m_max_players || m_prepare_boot)
+                if (RoundConnectedCountLocked() != m_max_players || m_prepare_boot)
                     return false;
                 m_start_requested = true;
             }
@@ -728,6 +736,16 @@ namespace
             return RequestRuntimeSettings(local_controller, delay, topology);
         }
 
+        bool RequestRoomCapacityImpl(std::uint32_t capacity)
+        {
+            return RequestRoomCapacity(capacity);
+        }
+
+        bool RequestReturnToLobbyImpl()
+        {
+            return RequestReturnToLobby();
+        }
+
     private:
         const char* RoleName() const
         {
@@ -770,6 +788,7 @@ namespace
                 m_delay.store(static_cast<std::uint32_t>(std::clamp(std::atoi(delay), 1, 100)), std::memory_order_release);
             if (const char* players = std::getenv("PCSX2_NETPLAY_PLAYERS"))
                 m_max_players = static_cast<std::uint32_t>(std::clamp(std::atoi(players), 1, 4));
+            m_room_capacity = m_max_players;
             if (const char* sync = std::getenv("PCSX2_NETPLAY_MEMCARD_SYNC"))
                 m_memory_card_sync_enabled = (std::atoi(sync) != 0);
         }
@@ -839,7 +858,15 @@ namespace
             m_last_error = message ? message : "unknown error";
         }
 
-        std::uint32_t ConnectedCountLocked() const
+        std::uint32_t RoomConnectedCountLocked() const
+        {
+            std::uint32_t count = 0;
+            for (std::uint32_t i = 0; i < m_room_capacity; i++)
+                count += m_players[i].connected ? 1u : 0u;
+            return count;
+        }
+
+        std::uint32_t RoundConnectedCountLocked() const
         {
             std::uint32_t count = 0;
             for (std::uint32_t i = 0; i < m_max_players; i++)
@@ -849,7 +876,7 @@ namespace
 
         bool AllGamesMatchLocked() const
         {
-            if (!m_game_selected || ConnectedCountLocked() != m_max_players)
+            if (!m_game_selected || RoundRoundConnectedCountLocked() != m_max_players)
                 return false;
             for (std::uint32_t i = 0; i < m_max_players; i++)
             {
@@ -863,7 +890,7 @@ namespace
         {
             if (!m_memory_card_sync_enabled)
                 return true;
-            if (ConnectedCountLocked() != m_max_players)
+            if (RoundConnectedCountLocked() != m_max_players)
                 return false;
             for (std::uint32_t i = 0; i < m_max_players; i++)
             {
@@ -875,7 +902,7 @@ namespace
 
         bool AllBootReadyLocked() const
         {
-            if (!m_prepare_boot || ConnectedCountLocked() != m_max_players)
+            if (!m_prepare_boot || RoundConnectedCountLocked() != m_max_players)
                 return false;
             for (std::uint32_t i = 0; i < m_max_players; i++)
             {
@@ -887,7 +914,7 @@ namespace
 
         bool AllFirstPollReadyLocked() const
         {
-            if (!m_prepare_boot || ConnectedCountLocked() != m_max_players)
+            if (!m_prepare_boot || RoundConnectedCountLocked() != m_max_players)
                 return false;
             for (std::uint32_t i = 0; i < m_max_players; i++)
             {
@@ -919,6 +946,9 @@ namespace
             m_start_committed = false;
             m_first_poll_go = false;
             m_frame = 0;
+            m_frame_counter.store(0, std::memory_order_release);
+            m_runtime_reconfiguring = false;
+            m_runtime_commit_pending = false;
             m_have_capture = false;
             m_capture = NEUTRAL_FRAME;
             m_output_bundle.fill(NEUTRAL_FRAME);
@@ -976,6 +1006,12 @@ namespace
             WriteU32(packet->data() + 20, player_id);
             WriteU64(packet->data() + 24, session);
             WriteU32(packet->data() + 32, memcard_sync ? 1u : 0u);
+            std::uint32_t round_info = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                round_info = (m_max_players & 0xffu) | (m_round_in_progress ? 0x80000000u : 0u);
+            }
+            WriteU32(packet->data() + 36, round_info);
             std::snprintf(reinterpret_cast<char*>(packet->data() + 40), 40, "%s", name.c_str());
             return true;
         }
@@ -991,7 +1027,7 @@ namespace
 
         std::uint32_t FindFreePlayerIdLocked() const
         {
-            for (std::uint32_t id = 2; id <= m_max_players; id++)
+            for (std::uint32_t id = 2; id <= m_room_capacity; id++)
             {
                 if (!m_players[id - 1].connected)
                     return id;
@@ -1009,9 +1045,13 @@ namespace
                 return false;
 
             std::uint32_t assigned = 0;
+            std::uint32_t capacity = 0;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (m_runtime_reconfiguring)
+                    return false;
                 assigned = FindFreePlayerIdLocked();
+                capacity = m_room_capacity;
             }
             if (assigned == 0)
                 return false;
@@ -1021,7 +1061,7 @@ namespace
                 client_name = "玩家" + std::to_string(assigned);
 
             std::array<std::uint8_t, HELLO_SIZE> outgoing{};
-            BuildHello(&outgoing, Role::Host, m_max_players, assigned, m_session_id,
+            BuildHello(&outgoing, Role::Host, capacity, assigned, m_session_id,
                 m_memory_card_sync_enabled, m_username);
             if (!SendAll(socket, outgoing.data(), outgoing.size()))
                 return false;
@@ -1048,13 +1088,19 @@ namespace
             const std::uint32_t max_players = ReadU32(incoming.data() + 12);
             const std::uint32_t delay = ReadU32(incoming.data() + 16);
             const std::uint32_t assigned = ReadU32(incoming.data() + 20);
-            if (max_players < 1 || max_players > MAX_PLAYERS || assigned < 2 || assigned > max_players)
+            const std::uint32_t round_info = ReadU32(incoming.data() + 36);
+            const std::uint32_t round_players = round_info & 0xffu;
+            const bool round_in_progress = (round_info & 0x80000000u) != 0;
+            if (max_players < 1 || max_players > MAX_PLAYERS || assigned < 2 || assigned > max_players ||
+                round_players < 1 || round_players > max_players)
                 return false;
 
             const std::string host_name = ReadHelloName(incoming);
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                m_max_players = max_players;
+                m_room_capacity = max_players;
+                m_max_players = round_players;
+                m_round_in_progress = round_in_progress;
                 m_local_player_id = assigned;
                 m_session_id = ReadU64(incoming.data() + 24);
                 m_memory_card_sync_enabled = (ReadU32(incoming.data() + 32) != 0);
@@ -1098,7 +1144,7 @@ namespace
             {
                 {
                     std::lock_guard<std::mutex> lock(m_state_mutex);
-                    m_connecting.store(ConnectedCountLocked() < m_max_players, std::memory_order_release);
+                    m_connecting.store(RoomConnectedCountLocked() < m_room_capacity, std::memory_order_release);
                 }
 
                 fd_set read_set;
@@ -1159,11 +1205,13 @@ namespace
                 BroadcastRoster();
 
                 bool selected = false;
+                bool round_active = false;
                 {
                     std::lock_guard<std::mutex> lock(m_state_mutex);
                     selected = m_game_selected;
+                    round_active = m_round_in_progress || m_prepare_boot || m_start_committed;
                 }
-                if (selected)
+                if (selected && !round_active)
                     SendGameManifestToPeer(*raw_peer);
             }
         }
@@ -1331,13 +1379,18 @@ namespace
         {
             if (m_role != Role::Host)
                 return;
-            std::array<std::uint8_t, 4 + MAX_PLAYERS * 48> payload{};
+            std::array<std::uint8_t, 12 + MAX_PLAYERS * 48> payload{};
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                WriteU32(payload.data(), m_max_players);
+                WriteU32(payload.data() + 0, m_room_capacity);
+                WriteU32(payload.data() + 4, m_max_players);
+                std::uint32_t room_flags = 0;
+                room_flags |= m_round_in_progress ? 1u : 0u;
+                room_flags |= m_game_switching ? 2u : 0u;
+                WriteU32(payload.data() + 8, room_flags);
                 for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
                 {
-                    std::uint8_t* row = payload.data() + 4 + i * 48;
+                    std::uint8_t* row = payload.data() + 12 + i * 48;
                     WriteU32(row + 0, i + 1);
                     std::uint32_t flags = 0;
                     flags |= m_players[i].connected ? 1u : 0u;
@@ -1385,16 +1438,22 @@ namespace
 
         void HandleRoster(const std::vector<std::uint8_t>& payload)
         {
-            if (payload.size() != (4 + MAX_PLAYERS * 48))
+            if (payload.size() != (12 + MAX_PLAYERS * 48))
                 return;
-            const std::uint32_t max_players = ReadU32(payload.data());
-            if (max_players < 1 || max_players > MAX_PLAYERS)
+            const std::uint32_t room_capacity = ReadU32(payload.data() + 0);
+            const std::uint32_t round_players = ReadU32(payload.data() + 4);
+            const std::uint32_t room_flags = ReadU32(payload.data() + 8);
+            if (room_capacity < 1 || room_capacity > MAX_PLAYERS ||
+                round_players < 1 || round_players > room_capacity)
                 return;
             std::lock_guard<std::mutex> lock(m_state_mutex);
-            m_max_players = max_players;
+            m_room_capacity = room_capacity;
+            m_max_players = round_players;
+            m_round_in_progress = (room_flags & 1u) != 0;
+            m_game_switching = (room_flags & 2u) != 0;
             for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
             {
-                const std::uint8_t* row = payload.data() + 4 + i * 48;
+                const std::uint8_t* row = payload.data() + 12 + i * 48;
                 const std::uint32_t id = ReadU32(row);
                 if (id != i + 1)
                     continue;
@@ -1878,7 +1937,7 @@ namespace
             bool begin_boot = false;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (!m_start_requested || m_prepare_boot || ConnectedCountLocked() != m_max_players || !AllGamesMatchLocked())
+                if (!m_start_requested || m_prepare_boot || RoundConnectedCountLocked() != m_max_players || !AllGamesMatchLocked())
                     return;
 
                 if (m_memory_card_sync_enabled)
@@ -1964,6 +2023,8 @@ namespace
                 if (AllBootReadyLocked() && !m_start_committed)
                 {
                     m_start_committed = true;
+                    m_round_in_progress = true;
+                    m_game_switching = false;
                     commit = true;
                 }
             }
@@ -2107,133 +2168,86 @@ namespace
                 *topology <= 1 && ValidateControllerMap(*controllers);
         }
 
-        void PauseForRuntimeReconfigure()
-        {
-            if (!VMManager::HasValidVM())
-                return;
-            Host::RunOnCPUThread([this]() {
-                if (!VMManager::HasValidVM())
-                    return;
-                const VMState state = VMManager::GetState();
-                {
-                    std::lock_guard<std::mutex> lock(m_state_mutex);
-                    m_resume_after_reconfig = (state == VMState::Running);
-                }
-                if (state == VMState::Running)
-                    VMManager::SetState(VMState::Paused);
-            }, true);
-        }
-
-        void ReloadRuntimePads()
-        {
-            if (!VMManager::HasValidVM())
-                return;
-            Host::RunOnCPUThread([this]() {
-                if (!VMManager::HasValidVM())
-                    return;
-                const std::uint32_t topology = m_topology_mode.load(std::memory_order_acquire);
-                EmuConfig.Pad.MultitapPort0_Enabled = (m_max_players >= 3 && topology == 0);
-                EmuConfig.Pad.MultitapPort1_Enabled = (m_max_players >= 3 && topology == 1);
-                auto lock = Host::GetSettingsLock();
-                Pad::LoadConfig(*Host::GetSettingsInterface());
-            }, true);
-        }
-
-        void ResetRuntimeInputEpoch(std::uint32_t change_id)
-        {
-            m_input_epoch.store(change_id, std::memory_order_release);
-            {
-                std::lock_guard<std::mutex> lock(m_input_mutex);
-                for (auto& map : m_player_inputs)
-                    map.clear();
-            }
-            {
-                std::lock_guard<std::mutex> lock(m_bundle_mutex);
-                m_bundles.clear();
-            }
-            m_frame = 0;
-            m_have_capture = false;
-            m_capture = NEUTRAL_FRAME;
-            m_last_logged_local_input = NEUTRAL_FRAME;
-            m_output_bundle.fill(NEUTRAL_FRAME);
-            m_input_cv.notify_all();
-            m_bundle_cv.notify_all();
-        }
-
-        bool ApplyRuntimeConfigLocal(std::uint32_t change_id, std::uint32_t delay,
+        bool StageRuntimeConfigLocal(std::uint32_t change_id, std::uint32_t delay,
             std::uint32_t topology, const std::array<std::uint32_t, MAX_PLAYERS>& controllers)
         {
-            if (delay < 1 || delay > 100 || topology > 1 || !ValidateControllerMap(controllers))
+            if (change_id == 0 || delay < 1 || delay > 100 || topology > 1 ||
+                !ValidateControllerMap(controllers))
                 return false;
-
-            const std::uint32_t old_delay = m_delay.load(std::memory_order_acquire);
             const std::uint32_t old_topology = m_topology_mode.load(std::memory_order_acquire);
-            const bool timing_changed = (delay != old_delay || topology != old_topology);
-            if (timing_changed && VMManager::HasValidVM())
+            if (VMManager::HasValidVM() && topology != old_topology)
                 return false;
 
-            // Controller ownership can change live without resetting the input epoch.
-            // The host is authoritative for player->controller routing.
-            if (!timing_changed)
-            {
-                {
-                    std::lock_guard<std::mutex> lock(m_state_mutex);
-                    m_runtime_reconfiguring = true;
-                    m_runtime_change_id = change_id;
-                    for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
-                        m_players[i].controller = controllers[i];
-                }
-                Log("runtime controller map locally applied: change=%u controllers=%u,%u,%u,%u",
-                    static_cast<unsigned>(change_id),
-                    static_cast<unsigned>(controllers[0]), static_cast<unsigned>(controllers[1]),
-                    static_cast<unsigned>(controllers[2]), static_cast<unsigned>(controllers[3]));
-                return true;
-            }
-
-            // Delay/topology changes are only safe before the VM starts.
-            PauseForRuntimeReconfigure();
-            {
-                std::lock_guard<std::mutex> lock(m_state_mutex);
-                m_runtime_reconfiguring = true;
-                m_runtime_change_id = change_id;
-                for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
-                    m_players[i].controller = controllers[i];
-                m_first_poll_go = false;
-                for (auto& player : m_players)
-                    player.first_poll_ready = false;
-            }
-            m_delay.store(delay, std::memory_order_release);
-            m_topology_mode.store(topology, std::memory_order_release);
-            ResetRuntimeInputEpoch(change_id);
-            ReloadRuntimePads();
-            Log("runtime config locally applied before VM start: change=%u delay=%u topology=%u controllers=%u,%u,%u,%u",
-                static_cast<unsigned>(change_id), static_cast<unsigned>(delay), static_cast<unsigned>(topology),
-                static_cast<unsigned>(controllers[0]), static_cast<unsigned>(controllers[1]),
-                static_cast<unsigned>(controllers[2]), static_cast<unsigned>(controllers[3]));
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            if (m_runtime_reconfiguring && m_runtime_change_id != change_id)
+                return false;
+            m_runtime_reconfiguring = true;
+            m_runtime_change_id = change_id;
+            m_runtime_commit_pending = false;
+            m_pending_runtime_delay = delay;
+            m_pending_runtime_topology = topology;
+            m_pending_runtime_controllers = controllers;
             return true;
         }
 
-        void FinishRuntimeConfig(std::uint32_t change_id)
+        void ApplyCommittedRuntimeConfig(std::uint32_t change_id)
         {
-            bool resume = false;
+            std::uint32_t delay = 0;
+            std::uint32_t topology = 0;
+            std::array<std::uint32_t, MAX_PLAYERS> controllers{};
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (!m_runtime_reconfiguring || !m_runtime_commit_pending ||
+                    m_runtime_change_id != change_id)
+                    return;
+                delay = m_pending_runtime_delay;
+                topology = m_pending_runtime_topology;
+                controllers = m_pending_runtime_controllers;
+                for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                    m_players[i].controller = controllers[i];
+                m_runtime_reconfiguring = false;
+                m_runtime_commit_pending = false;
+                m_runtime_change_id = 0;
+            }
+            m_delay.store(delay, std::memory_order_release);
+            m_topology_mode.store(topology, std::memory_order_release);
+            Host::AddKeyedOSDMessage("ModernNetplayRuntimeConfig",
+                "联机实时设置已在统一输入点生效。", 5.0f);
+            Log("runtime config applied: change=%u frame=%u delay=%u",
+                static_cast<unsigned>(change_id), static_cast<unsigned>(m_frame),
+                static_cast<unsigned>(delay));
+            if (m_role == Role::Host)
+                BroadcastRoster();
+        }
+
+        void ScheduleRuntimeConfigCommit(std::uint32_t change_id, std::uint32_t apply_frame)
+        {
+            bool apply_now = false;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 if (!m_runtime_reconfiguring || m_runtime_change_id != change_id)
                     return;
-                m_runtime_reconfiguring = false;
-                resume = m_resume_after_reconfig;
-                m_resume_after_reconfig = false;
+                m_runtime_commit_frame = apply_frame;
+                m_runtime_commit_pending = true;
+                apply_now = !VMManager::HasValidVM();
             }
-            if (resume && VMManager::HasValidVM())
+            if (apply_now)
+                ApplyCommittedRuntimeConfig(change_id);
+        }
+
+        void ApplyPendingRuntimeConfigIfDue()
+        {
+            std::uint32_t change_id = 0;
+            std::uint32_t target = 0;
             {
-                Host::RunOnCPUThread([]() {
-                    if (VMManager::HasValidVM() && VMManager::GetState() == VMState::Paused)
-                        VMManager::SetState(VMState::Running);
-                });
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (!m_runtime_reconfiguring || !m_runtime_commit_pending)
+                    return;
+                change_id = m_runtime_change_id;
+                target = m_runtime_commit_frame;
             }
-            Host::AddKeyedOSDMessage("ModernNetplayRuntimeConfig",
-                "联机实时设置已同步应用。", 5.0f);
-            Log("runtime config committed: change=%u", static_cast<unsigned>(change_id));
+            if (m_frame >= target)
+                ApplyCommittedRuntimeConfig(change_id);
         }
 
         void MaybeCommitRuntimeConfig()
@@ -2247,9 +2261,9 @@ namespace
                 if (!m_runtime_reconfiguring)
                     return;
                 ready = true;
-                for (std::uint32_t i = 0; i < m_max_players; i++)
+                for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
                 {
-                    if (m_players[i].connected && !m_runtime_acks[i])
+                    if (m_runtime_required_acks[i] && !m_runtime_acks[i])
                     {
                         ready = false;
                         break;
@@ -2259,34 +2273,44 @@ namespace
             }
             if (!ready)
                 return;
-            std::array<std::uint8_t, 4> payload{};
+
+            const std::uint32_t apply_frame = VMManager::HasValidVM() ?
+                (m_frame_counter.load(std::memory_order_acquire) + 120u) : 0u;
+            std::array<std::uint8_t, 8> payload{};
             WriteU32(payload.data(), change_id);
-            BroadcastControl(ControlType::RuntimeCommit, payload.data(), static_cast<std::uint32_t>(payload.size()));
-            FinishRuntimeConfig(change_id);
-            BroadcastRoster();
+            WriteU32(payload.data() + 4, apply_frame);
+            BroadcastControl(ControlType::RuntimeCommit, payload.data(),
+                static_cast<std::uint32_t>(payload.size()));
+            ScheduleRuntimeConfigCommit(change_id, apply_frame);
+            Log("runtime config target: change=%u poll=%u",
+                static_cast<unsigned>(change_id), static_cast<unsigned>(apply_frame));
         }
 
         bool BeginHostRuntimeConfig(std::uint32_t delay, std::uint32_t topology,
-            const std::array<std::uint32_t, MAX_PLAYERS>& controllers)
+            std::array<std::uint32_t, MAX_PLAYERS> controllers)
         {
-            if (m_role != Role::Host || delay < 1 || delay > 100 || topology > 1 ||
-                !ValidateControllerMap(controllers))
+            if (m_role != Role::Host || delay < 1 || delay > 100 || topology > 1)
                 return false;
 
             const std::uint32_t current_delay = m_delay.load(std::memory_order_acquire);
             const std::uint32_t current_topology = m_topology_mode.load(std::memory_order_acquire);
-            const auto current_controllers = CurrentControllerMap();
-            if (delay == current_delay && topology == current_topology && controllers == current_controllers)
+
+            if (m_max_players <= 2)
             {
-                Log("runtime settings request ignored: no changes");
-                return true;
+                for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                    controllers[i] = i + 1;
             }
-            if (VMManager::HasValidVM() && (delay != current_delay || topology != current_topology))
+            if (!ValidateControllerMap(controllers))
+                return false;
+
+            const auto current_controllers = CurrentControllerMap();
+            if (delay == current_delay && topology == current_topology &&
+                controllers == current_controllers)
+                return true;
+
+            if (VMManager::HasValidVM() && topology != current_topology)
             {
-                SetLastError("游戏运行中为防止不同步，只允许更换控制位；输入延迟和多人手柄布局请在下一局开始前调整");
-                Log("runtime timing/topology change rejected while VM is active: delay %u->%u topology %u->%u",
-                    static_cast<unsigned>(current_delay), static_cast<unsigned>(delay),
-                    static_cast<unsigned>(current_topology), static_cast<unsigned>(topology));
+                SetLastError("游戏运行中可以实时修改输入延迟；多人手柄布局请切换游戏后调整");
                 return false;
             }
 
@@ -2301,18 +2325,19 @@ namespace
                 m_runtime_reconfiguring = true;
                 m_runtime_change_id = change_id;
                 m_runtime_acks.fill(false);
+                m_runtime_required_acks.fill(false);
+                for (std::uint32_t i = 0; i < m_room_capacity; i++)
+                    m_runtime_required_acks[i] = m_players[i].connected;
             }
-            const auto payload = BuildRuntimeConfig(change_id, delay, topology, controllers);
-            BroadcastControl(ControlType::RuntimeApply, payload.data(), static_cast<std::uint32_t>(payload.size()));
-            if (!ApplyRuntimeConfigLocal(change_id, delay, topology, controllers))
-            {
-                Fail("failed to apply host runtime Netplay configuration");
+
+            if (!StageRuntimeConfigLocal(change_id, delay, topology, controllers))
                 return false;
-            }
+            const auto payload = BuildRuntimeConfig(change_id, delay, topology, controllers);
+            BroadcastControl(ControlType::RuntimeApply, payload.data(),
+                static_cast<std::uint32_t>(payload.size()));
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                if (m_runtime_reconfiguring && m_runtime_change_id == change_id)
-                    m_runtime_acks[0] = true;
+                m_runtime_acks[0] = true;
             }
             BroadcastRoster();
             MaybeCommitRuntimeConfig();
@@ -2322,10 +2347,12 @@ namespace
         bool RequestRuntimeSettings(std::uint32_t local_controller,
             std::uint32_t delay, std::uint32_t topology)
         {
-            if (local_controller < 1 || local_controller > m_max_players)
-                return false;
             if (m_role == Role::Client)
             {
+                if (m_max_players <= 2)
+                    return true;
+                if (local_controller < 1 || local_controller > m_max_players)
+                    return false;
                 std::array<std::uint8_t, 4> payload{};
                 WriteU32(payload.data(), local_controller);
                 return SendControlToHost(ControlType::RuntimeRequest,
@@ -2337,25 +2364,31 @@ namespace
             delay = std::clamp<std::uint32_t>(delay, 1, 100);
             topology = std::min<std::uint32_t>(topology, 1);
             auto controllers = CurrentControllerMap();
-            const std::uint32_t current = controllers[0];
-            if (current != local_controller)
+            if (m_max_players >= 3)
             {
-                for (std::uint32_t i = 0; i < m_max_players; i++)
+                if (local_controller < 1 || local_controller > m_max_players)
+                    return false;
+                const std::uint32_t current = controllers[0];
+                if (current != local_controller)
                 {
-                    if (controllers[i] == local_controller)
+                    for (std::uint32_t i = 0; i < m_max_players; i++)
                     {
-                        controllers[i] = current;
-                        break;
+                        if (controllers[i] == local_controller)
+                        {
+                            controllers[i] = current;
+                            break;
+                        }
                     }
+                    controllers[0] = local_controller;
                 }
-                controllers[0] = local_controller;
             }
             return BeginHostRuntimeConfig(delay, topology, controllers);
         }
 
         void HandleRuntimeRequest(std::uint32_t requester_id, std::uint32_t desired_controller)
         {
-            if (m_role != Role::Host || requester_id < 1 || requester_id > m_max_players ||
+            if (m_role != Role::Host || m_max_players <= 2 ||
+                requester_id < 1 || requester_id > m_max_players ||
                 desired_controller < 1 || desired_controller > m_max_players)
                 return;
             auto controllers = CurrentControllerMap();
@@ -2375,6 +2408,89 @@ namespace
             }
             BeginHostRuntimeConfig(m_delay.load(std::memory_order_acquire),
                 m_topology_mode.load(std::memory_order_acquire), controllers);
+        }
+
+        bool RequestRoomCapacity(std::uint32_t capacity)
+        {
+            if (m_role != Role::Host || capacity < 1 || capacity > MAX_PLAYERS)
+                return false;
+            std::uint32_t previous = 0;
+            bool start_listener = false;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                previous = m_room_capacity;
+                if (capacity < previous)
+                {
+                    m_last_error = "当前会话只支持实时增加人数，不支持缩小房间";
+                    return false;
+                }
+                if (capacity == previous)
+                    return true;
+                m_room_capacity = capacity;
+                for (std::uint32_t i = previous; i < capacity; i++)
+                    m_players[i].controller = i + 1;
+                if (!m_round_in_progress && !m_start_committed && !VMManager::HasValidVM())
+                    m_max_players = capacity;
+                start_listener = (previous == 1 && capacity > 1 && !m_connector.joinable());
+                m_connecting.store(RoomConnectedCountLocked() < m_room_capacity,
+                    std::memory_order_release);
+            }
+            if (start_listener)
+                m_connector = std::thread([this]() { AcceptLoop(); });
+            Log("room capacity expanded: %u -> %u; active round=%u",
+                static_cast<unsigned>(previous), static_cast<unsigned>(capacity),
+                static_cast<unsigned>(m_max_players));
+            Host::AddKeyedOSDMessage("ModernNetplayCapacity",
+                "联机房间已扩容；新玩家可直接加入，当前本局不会被打断。", 7.0f);
+            BroadcastRoster();
+            return true;
+        }
+
+        void ReturnToLobbyLocal(const char* reason)
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                m_game_switching = true;
+                m_round_in_progress = false;
+                m_game_selected = false;
+                m_local_game_match = false;
+                m_game_title.clear();
+                m_game_serial.clear();
+                m_game_crc = 0;
+                m_local_game_path.clear();
+                ResetStartStateLocked();
+                m_max_players = m_room_capacity;
+                for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                {
+                    m_players[i].game_match = false;
+                    m_players[i].controller = i + 1;
+                }
+                m_last_error = reason ? reason : "已返回联机房间";
+            }
+            std::uint32_t epoch = m_input_epoch.fetch_add(1, std::memory_order_acq_rel) + 1u;
+            if (epoch == 0)
+                m_input_epoch.store(1, std::memory_order_release);
+            m_frame_counter.store(0, std::memory_order_release);
+            m_input_cv.notify_all();
+            m_bundle_cv.notify_all();
+            m_boot_cv.notify_all();
+            m_first_poll_cv.notify_all();
+            Host::RunOnCPUThread([]() {
+                if (VMManager::HasValidVM())
+                    VMManager::SetState(VMState::Stopping);
+            });
+            Host::AddKeyedOSDMessage("ModernNetplayReturnLobby",
+                "当前游戏已同步结束，联机房间和连接保持。", 7.0f);
+        }
+
+        bool RequestReturnToLobby()
+        {
+            if (m_role != Role::Host)
+                return false;
+            BroadcastControl(ControlType::RoundEnd, nullptr, 0);
+            ReturnToLobbyLocal("已同步结束当前游戏，可直接选择下一款游戏");
+            BroadcastRoster();
+            return true;
         }
 
         void BroadcastSessionAbort(const std::string& reason)
@@ -2567,6 +2683,7 @@ namespace
                 return false;
             if (!WaitForFirstPollBarrier())
                 return false;
+            ApplyPendingRuntimeConfigIfDue();
 
             if (m_have_capture)
             {
@@ -2590,6 +2707,7 @@ namespace
                     return false;
                 }
                 ++m_frame;
+                m_frame_counter.store(m_frame, std::memory_order_release);
             }
             else
             {
@@ -2974,6 +3092,8 @@ namespace
                     {
                         std::lock_guard<std::mutex> lock(m_state_mutex);
                         m_start_committed = true;
+                        m_round_in_progress = true;
+                        m_game_switching = false;
                     }
                     Log("START_COMMIT received");
                     m_boot_cv.notify_all();
@@ -3004,7 +3124,7 @@ namespace
                     std::uint32_t topology = 0;
                     std::array<std::uint32_t, MAX_PLAYERS> controllers{};
                     if (!ParseRuntimeConfig(payload, &change_id, &delay, &topology, &controllers) ||
-                        !ApplyRuntimeConfigLocal(change_id, delay, topology, controllers))
+                        !StageRuntimeConfigLocal(change_id, delay, topology, controllers))
                     {
                         Fail("invalid runtime Netplay configuration");
                         break;
@@ -3017,10 +3137,13 @@ namespace
                 }
                 case ControlType::RuntimeCommit:
                 {
-                    if (payload.size() == 4)
-                        FinishRuntimeConfig(ReadU32(payload.data()));
+                    if (payload.size() == 8)
+                        ScheduleRuntimeConfigCommit(ReadU32(payload.data()), ReadU32(payload.data() + 4));
                     break;
                 }
+                case ControlType::RoundEnd:
+                    ReturnToLobbyLocal("房主已同步结束当前游戏，等待下一局");
+                    break;
                 default:
                     break;
             }
@@ -3048,6 +3171,7 @@ namespace
         std::string m_username;
         std::string m_host = "127.0.0.1";
         std::uint16_t m_port = DEFAULT_PORT;
+        std::uint32_t m_room_capacity = 2;
         std::uint32_t m_max_players = 2;
         std::uint32_t m_local_player_id = 0;
         std::uint64_t m_session_id = 0;
@@ -3062,6 +3186,12 @@ namespace
         std::uint32_t m_runtime_change_counter = 0;
         std::uint32_t m_runtime_change_id = 0;
         std::array<bool, MAX_PLAYERS> m_runtime_acks{};
+        std::array<bool, MAX_PLAYERS> m_runtime_required_acks{};
+        std::uint32_t m_pending_runtime_delay = 2;
+        std::uint32_t m_pending_runtime_topology = 1;
+        std::array<std::uint32_t, MAX_PLAYERS> m_pending_runtime_controllers{1, 2, 3, 4};
+        std::uint32_t m_runtime_commit_frame = 0;
+        bool m_runtime_commit_pending = false;
         bool m_game_selected = false;
         bool m_local_game_match = false;
         std::string m_game_title;
@@ -3089,8 +3219,11 @@ namespace
         bool m_local_boot_ready = false;
         bool m_start_committed = false;
         bool m_first_poll_go = false;
+        bool m_round_in_progress = false;
+        bool m_game_switching = false;
 
         std::uint32_t m_frame = 0;
+        std::atomic<std::uint32_t> m_frame_counter{0};
         bool m_have_capture = false;
         InputFrame m_capture = NEUTRAL_FRAME;
         InputFrame m_last_logged_local_input = NEUTRAL_FRAME;
@@ -3179,6 +3312,8 @@ bool RequestRuntimeSettings(std::uint32_t local_controller, std::uint32_t delay,
 {
     return GetSession().RequestRuntimeSettingsImpl(local_controller, delay, topology_mode);
 }
+bool RequestRoomCapacity(std::uint32_t max_players) { return GetSession().RequestRoomCapacityImpl(max_players); }
+bool RequestReturnToLobby() { return GetSession().RequestReturnToLobbyImpl(); }
 bool CanStartVM() { return GetSession().CanStartVM(); }
 bool ShouldHoldBootBarrier() { return GetSession().ShouldHoldBootBarrier(); }
 void NotifyBootReady() { GetSession().NotifyBootReady(); }
@@ -3201,6 +3336,8 @@ bool HostSelectGame(const std::string&, const std::string&, const std::string&, 
 bool RequestSynchronizedBoot() { return false; }
 bool ConsumeBootLaunchRequest(std::string*) { return false; }
 bool RequestRuntimeSettings(std::uint32_t, std::uint32_t, std::uint32_t) { return false; }
+bool RequestRoomCapacity(std::uint32_t) { return false; }
+bool RequestReturnToLobby() { return false; }
 bool CanStartVM() { return true; }
 bool ShouldHoldBootBarrier() { return false; }
 void NotifyBootReady() {}

@@ -58,8 +58,10 @@ private:
     QComboBox* m_local_controller = nullptr;
     QComboBox* m_topology_mode = nullptr;
     QSpinBox* m_runtime_delay = nullptr;
+    QSpinBox* m_runtime_players = nullptr;
     QPushButton* m_runtime_toggle = nullptr;
     QGroupBox* m_runtime_group = nullptr;
     QPushButton* m_apply_runtime = nullptr;
     QString m_last_memcard_error_shown;
+    bool m_switch_game_pending = false;
 };

@@ -274,6 +274,12 @@ void NetplayDialog::buildLobbyUi()
     m_runtime_delay->setValue(static_cast<int>(lobby_status.delay));
     runtime_form->addRow(tr("输入延迟："), m_runtime_delay);
 
+    m_runtime_players = new QSpinBox(m_runtime_group);
+    m_runtime_players->setRange(static_cast<int>(lobby_status.max_players), static_cast<int>(ModernNetplay::MAX_PLAYERS));
+    m_runtime_players->setValue(static_cast<int>(lobby_status.max_players));
+    m_runtime_players->setSuffix(tr(" 人"));
+    runtime_form->addRow(tr("房间人数："), m_runtime_players);
+
     m_topology_mode = new QComboBox(m_runtime_group);
     m_topology_mode->addItem(tr("兼容模式 A：Multitap 接 1 号端口（暴走单车等）"), 0);
     m_topology_mode->addItem(tr("兼容模式 B：Multitap 接 2 号端口（按 Start 加入类）"), 1);
@@ -283,9 +289,10 @@ void NetplayDialog::buildLobbyUi()
     m_apply_runtime = new QPushButton(tr("应用实时设置"), m_runtime_group);
     runtime_form->addRow(QString(), m_apply_runtime);
     auto* runtime_note = new QLabel(
-        tr("游戏运行中仍可切换自己控制的 P1～P4。为避免破坏模拟时间线，"
-           "输入延迟和多人手柄布局只允许在游戏开始前调整；游戏启动后这两项会锁定。"
-           "检测到持续不同步时，所有玩家会自动暂停并弹出提示。"), m_runtime_group);
+        tr("输入延迟可在游戏中实时调整，并在全员相同的输入检查点统一生效。"
+           "1～2 人房固定连接1=P1、连接2=P2，禁止互换；3～4 人房才开放 P1～P4 调整。"
+           "房间人数可实时增加到 4 人，游戏途中加入的新玩家会在当前房间等待下一局。"
+           "多人手柄布局涉及虚拟硬件，游戏运行中仍会锁定。"), m_runtime_group);
     runtime_note->setWordWrap(true);
     runtime_form->addRow(QString(), runtime_note);
     root->addWidget(m_runtime_group);
@@ -343,30 +350,67 @@ void NetplayDialog::buildLobbyUi()
             QMessageBox::warning(this, tr("联机"), tr("无法重建联机连接。"));
         refreshLobby();
     });
-    connect(m_start_game, &QPushButton::clicked, this, [this]() { chooseGameAndStart(); });
+    connect(m_start_game, &QPushButton::clicked, this, [this]() {
+        if (QtHost::IsVMValid())
+        {
+            const auto answer = QMessageBox::question(this, tr("切换联机游戏"),
+                tr("将同步结束所有玩家当前游戏，但保留联机房间和玩家连接。\n"
+                   "停止完成后直接选择新游戏，不需要重启 PCSX2。是否继续？"),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+            if (answer != QMessageBox::Yes)
+                return;
+            if (!ModernNetplay::RequestReturnToLobby())
+            {
+                QMessageBox::warning(this, tr("切换联机游戏"), tr("无法同步返回联机房间。"));
+                return;
+            }
+            m_switch_game_pending = true;
+            return;
+        }
+        chooseGameAndStart();
+    });
     connect(m_apply_runtime, &QPushButton::clicked, this, [this]() {
-        const ModernNetplay::StatusSnapshot current = ModernNetplay::GetStatusSnapshot();
+        ModernNetplay::StatusSnapshot current = ModernNetplay::GetStatusSnapshot();
         if (current.runtime_reconfiguring)
         {
             QMessageBox::information(this, tr("实时联机设置"), tr("上一项实时设置正在同步，请稍候。"));
             return;
         }
-        const std::uint32_t controller = static_cast<std::uint32_t>(m_local_controller->currentData().toUInt());
+
+        if (current.role == "host")
+        {
+            const std::uint32_t capacity = static_cast<std::uint32_t>(m_runtime_players->value());
+            if (capacity > current.max_players)
+            {
+                if (!ModernNetplay::RequestRoomCapacity(capacity))
+                {
+                    QMessageBox::warning(this, tr("实时联机设置"), tr("无法增加房间人数。"));
+                    return;
+                }
+                current = ModernNetplay::GetStatusSnapshot();
+            }
+        }
+
+        std::uint32_t controller = current.local_player_id;
+        if (current.round_players >= 3)
+            controller = static_cast<std::uint32_t>(m_local_controller->currentData().toUInt());
+
         const std::uint32_t delay = (current.role == "host") ?
             static_cast<std::uint32_t>(m_runtime_delay->value()) : current.delay;
         const std::uint32_t topology = (current.role == "host") ?
             static_cast<std::uint32_t>(m_topology_mode->currentData().toUInt()) : current.topology_mode;
-        if (QtHost::IsVMValid() && current.role == "host" &&
-            (delay != current.delay || topology != current.topology_mode))
+
+        if (QtHost::IsVMValid() && current.role == "host" && topology != current.topology_mode)
         {
             QMessageBox::information(this, tr("实时联机设置"),
-                tr("为防止联机不同步，游戏运行中不能修改输入延迟或多人手柄布局。\n\n"
-                   "运行中仍可切换 P1～P4 控制位；延迟和布局请在下一局开始前调整。"));
+                tr("输入延迟可以在游戏中实时调整。\n\n"
+                   "多人手柄布局会改变虚拟 PS2 手柄硬件，请切换/重新同步游戏后修改。"));
             return;
         }
+
         if (!ModernNetplay::RequestRuntimeSettings(controller, delay, topology))
             QMessageBox::warning(this, tr("实时联机设置"),
-                tr("无法应用设置。可能正在进行另一项同步调整，或当前修改会破坏运行中的同步时间线。"));
+                tr("无法应用设置。可能正在进行另一项同步调整。"));
     });
     connect(leave_button, &QPushButton::clicked, this, [this]() { launchNormalInstance(); });
 
@@ -488,7 +532,11 @@ void NetplayDialog::refreshLobby()
     else if (!status.last_error.empty() && !status.start_requested)
         m_room_status->setText(tr("%1 · 房间仍可继续使用").arg(QString::fromStdString(status.last_error)));
     else if (status.room_full)
-        m_room_status->setText(tr("房间已就绪 · %1 / %2 人 · 输入延迟 %3 帧").arg(status.player_count).arg(status.max_players).arg(status.delay));
+        m_room_status->setText(status.round_in_progress && status.max_players > status.round_players ?
+            tr("房间已扩容 · %1 / %2 人 · 本局 %3 人进行中 · 新玩家等待下一局 · 延迟 %4 帧")
+                .arg(status.player_count).arg(status.max_players).arg(status.round_players).arg(status.delay) :
+            tr("房间已就绪 · %1 / %2 人 · 输入延迟 %3 帧")
+                .arg(status.player_count).arg(status.max_players).arg(status.delay));
     else if (is_host)
         m_room_status->setText(tr("等待玩家加入… · %1 / %2 人 · TCP %3").arg(status.player_count).arg(status.max_players).arg(status.port));
     else if (status.connected)
@@ -503,7 +551,9 @@ void NetplayDialog::refreshLobby()
         m_players_table->setItem(static_cast<int>(i), 0, new QTableWidgetItem(tr("连接%1").arg(i + 1)));
         m_players_table->setItem(static_cast<int>(i), 1, new QTableWidgetItem(player.connected ? QString::fromStdString(player.name) : tr("等待加入")));
         m_players_table->setItem(static_cast<int>(i), 2, new QTableWidgetItem(player.connected && player.controller > 0 ? tr("P%1").arg(player.controller) : QStringLiteral("-")));
-        m_players_table->setItem(static_cast<int>(i), 3, new QTableWidgetItem(player.connected ? (player.game_match ? tr("匹配 ✓") : tr("等待")) : QStringLiteral("-")));
+        const bool waiting_next_round = player.connected && status.round_in_progress && (i >= status.round_players);
+        m_players_table->setItem(static_cast<int>(i), 3, new QTableWidgetItem(player.connected ?
+            (waiting_next_round ? tr("等待下一局") : (player.game_match ? tr("匹配 ✓") : tr("等待"))) : QStringLiteral("-")));
         m_players_table->setItem(static_cast<int>(i), 4, new QTableWidgetItem(player.connected ? (player.memcard_ready ? tr("完成 ✓") : tr("等待")) : QStringLiteral("-")));
         m_players_table->setItem(static_cast<int>(i), 5, new QTableWidgetItem(player.connected ? (player.boot_ready ? tr("就绪 ✓") : tr("等待")) : QStringLiteral("-")));
     }
@@ -583,7 +633,9 @@ void NetplayDialog::refreshLobby()
         }
     }
 
-    if (!status.start_requested)
+    if (status.game_switching)
+        m_boot_status->setText(tr("正在同步结束当前游戏并返回联机房间…"));
+    else if (!status.start_requested)
         m_boot_status->setText(tr("等待房主选择游戏。"));
     else if (!status.prepare_boot)
         m_boot_status->setText(tr("正在校验游戏并同步记忆卡…"));
@@ -617,16 +669,45 @@ void NetplayDialog::refreshLobby()
     }
     if (m_runtime_delay && !m_runtime_delay->hasFocus())
         m_runtime_delay->setValue(static_cast<int>(status.delay));
+    if (m_runtime_players && !m_runtime_players->hasFocus())
+    {
+        m_runtime_players->setMinimum(static_cast<int>(status.max_players));
+        m_runtime_players->setValue(static_cast<int>(status.max_players));
+    }
     if (m_topology_mode && !m_topology_mode->hasFocus())
         m_topology_mode->setCurrentIndex(status.topology_mode == 0 ? 0 : 1);
+
     const bool vm_active = QtHost::IsVMValid();
-    m_runtime_delay->setEnabled(is_host && !vm_active && !status.runtime_reconfiguring);
-    m_topology_mode->setEnabled(is_host && status.max_players >= 3 && !vm_active && !status.runtime_reconfiguring);
-    m_local_controller->setEnabled(!status.runtime_reconfiguring);
+    m_runtime_delay->setEnabled(is_host && !status.runtime_reconfiguring);
+    m_runtime_players->setEnabled(is_host && status.max_players < ModernNetplay::MAX_PLAYERS && !status.runtime_reconfiguring);
+    m_topology_mode->setEnabled(is_host && status.round_players >= 3 && !vm_active && !status.runtime_reconfiguring);
+
+    const bool controller_swapping_allowed = (status.round_players >= 3);
+    m_local_controller->setEnabled(controller_swapping_allowed && !status.runtime_reconfiguring);
+    if (!controller_swapping_allowed)
+    {
+        const int fixed_index = m_local_controller->findData(static_cast<int>(status.local_player_id));
+        if (fixed_index >= 0)
+            m_local_controller->setCurrentIndex(fixed_index);
+        m_local_controller->setToolTip(tr("1～2 人房固定：连接1=P1、连接2=P2，不能互换。"));
+    }
+    else
+    {
+        m_local_controller->setToolTip(QString());
+    }
     m_apply_runtime->setEnabled(!status.runtime_reconfiguring);
 
     m_start_game->setVisible(is_host);
-    m_start_game->setEnabled(is_host && status.room_full && !status.start_requested && !QtHost::IsVMValid());
+    m_start_game->setText(vm_active ? tr("切换游戏...") : tr("选择游戏并开始..."));
+    m_start_game->setEnabled(is_host && (vm_active ||
+        (status.room_full && !status.start_requested && !status.game_switching)));
+
+    if (m_switch_game_pending && !QtHost::IsVMValid() && status.room_full &&
+        !status.start_requested)
+    {
+        m_switch_game_pending = false;
+        QTimer::singleShot(0, this, [this]() { chooseGameAndStart(); });
+    }
 
     std::string launch_path;
     if (ModernNetplay::ConsumeBootLaunchRequest(&launch_path))
