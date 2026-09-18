@@ -54,8 +54,11 @@ namespace ModernNetplay
         bool memory_card_local_ready = false;
         bool memory_card_all_ready = false;
         bool memory_card_present = false;
+        bool memory_card_transfer_active = false;
+        bool memory_card_failed = false;
         std::uint64_t memory_card_crc = 0;
         std::uint32_t memory_card_size = 0;
+        std::uint64_t memory_card_transferred_bytes = 0;
         std::string memory_card_status;
 
         bool start_requested = false;
@@ -89,7 +92,7 @@ namespace ModernNetplay
     bool ConsumeBootLaunchRequest(std::string* path);
 
     // Live Netplay controls. Every peer may request its logical P1-P4 controller.
-    // Delay/topology are host-authoritative and can be changed during gameplay.
+    // Delay/topology are host-authoritative and are locked once a VM is running.
     bool RequestRuntimeSettings(std::uint32_t local_controller,
         std::uint32_t delay, std::uint32_t topology_mode);
 

@@ -8,6 +8,7 @@
 #include "pcsx2/GameList.h"
 #include "pcsx2/VMManager.h"
 
+#include <algorithm>
 #include <QtCore/QCoreApplication>
 #include <QtCore/QDir>
 #include <QtCore/QFileInfo>
@@ -28,6 +29,7 @@
 #include <QtWidgets/QLineEdit>
 #include <QtWidgets/QMessageBox>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QProgressBar>
 #include <QtWidgets/QSpinBox>
 #include <QtWidgets/QTabWidget>
 #include <QtWidgets/QTableWidget>
@@ -253,34 +255,45 @@ void NetplayDialog::buildLobbyUi()
     root->addWidget(m_players_table, 1);
 
     const ModernNetplay::StatusSnapshot lobby_status = ModernNetplay::GetStatusSnapshot();
-    auto* runtime_group = new QGroupBox(tr("实时联机控制"), this);
-    auto* runtime_form = new QFormLayout(runtime_group);
-    m_local_controller = new QComboBox(runtime_group);
+    m_runtime_toggle = new QPushButton(tr("实时联机控制…"), this);
+    m_runtime_toggle->setCheckable(true);
+    m_runtime_toggle->setChecked(false);
+    root->addWidget(m_runtime_toggle);
+
+    m_runtime_group = new QGroupBox(this);
+    m_runtime_group->setVisible(false);
+    auto* runtime_form = new QFormLayout(m_runtime_group);
+    m_local_controller = new QComboBox(m_runtime_group);
     for (std::uint32_t i = 1; i <= lobby_status.max_players; i++)
         m_local_controller->addItem(tr("P%1").arg(i), static_cast<int>(i));
     runtime_form->addRow(tr("我控制："), m_local_controller);
 
-    m_runtime_delay = new QSpinBox(runtime_group);
+    m_runtime_delay = new QSpinBox(m_runtime_group);
     m_runtime_delay->setRange(1, 100);
     m_runtime_delay->setSuffix(tr(" 帧"));
     m_runtime_delay->setValue(static_cast<int>(lobby_status.delay));
     runtime_form->addRow(tr("输入延迟："), m_runtime_delay);
 
-    m_topology_mode = new QComboBox(runtime_group);
+    m_topology_mode = new QComboBox(m_runtime_group);
     m_topology_mode->addItem(tr("兼容模式 A：Multitap 接 1 号端口（暴走单车等）"), 0);
     m_topology_mode->addItem(tr("兼容模式 B：Multitap 接 2 号端口（按 Start 加入类）"), 1);
     m_topology_mode->setCurrentIndex(lobby_status.topology_mode == 0 ? 0 : 1);
     runtime_form->addRow(tr("多人手柄布局："), m_topology_mode);
 
-    m_apply_runtime = new QPushButton(tr("应用实时设置"), runtime_group);
+    m_apply_runtime = new QPushButton(tr("应用实时设置"), m_runtime_group);
     runtime_form->addRow(QString(), m_apply_runtime);
     auto* runtime_note = new QLabel(
         tr("游戏运行中仍可切换自己控制的 P1～P4。为避免破坏模拟时间线，"
            "输入延迟和多人手柄布局只允许在游戏开始前调整；游戏启动后这两项会锁定。"
-           "检测到持续不同步时，所有玩家会自动暂停并弹出提示。"), runtime_group);
+           "检测到持续不同步时，所有玩家会自动暂停并弹出提示。"), m_runtime_group);
     runtime_note->setWordWrap(true);
     runtime_form->addRow(QString(), runtime_note);
-    root->addWidget(runtime_group);
+    root->addWidget(m_runtime_group);
+
+    connect(m_runtime_toggle, &QPushButton::toggled, this, [this](bool expanded) {
+        m_runtime_group->setVisible(expanded);
+        m_runtime_toggle->setText(expanded ? tr("实时联机控制 ▲") : tr("实时联机控制…"));
+    });
 
     auto* state_group = new QGroupBox(tr("同步状态"), this);
     auto* state_form = new QFormLayout(state_group);
@@ -288,12 +301,18 @@ void NetplayDialog::buildLobbyUi()
     m_game_status->setWordWrap(true);
     m_memcard_status = new QLabel(state_group);
     m_memcard_status->setWordWrap(true);
+    m_memcard_progress = new QProgressBar(state_group);
+    m_memcard_progress->setRange(0, 1000);
+    m_memcard_progress->setValue(0);
+    m_memcard_progress->setTextVisible(true);
+    m_memcard_progress->setVisible(false);
     m_boot_status = new QLabel(state_group);
     m_boot_status->setWordWrap(true);
     m_session_status = new QLabel(state_group);
     m_session_status->setTextInteractionFlags(Qt::TextSelectableByMouse);
     state_form->addRow(tr("游戏："), m_game_status);
     state_form->addRow(tr("记忆卡："), m_memcard_status);
+    state_form->addRow(QString(), m_memcard_progress);
     state_form->addRow(tr("启动："), m_boot_status);
     state_form->addRow(tr("会话："), m_session_status);
     root->addWidget(state_group);
@@ -507,6 +526,62 @@ void NetplayDialog::refreshLobby()
         m_memcard_status->setText(status.memory_card_present ? tr("全员同步完成 ✓ · 临时副本 · %1 KB").arg(status.memory_card_size / 1024) : tr("全员同步为无记忆卡状态 ✓"));
     else
         m_memcard_status->setText(QString::fromStdString(status.memory_card_status.empty() ? std::string("等待房主开始同步") : status.memory_card_status));
+
+    if (!status.memory_card_sync_enabled)
+    {
+        m_memcard_progress->setVisible(false);
+    }
+    else if (status.memory_card_transfer_active || status.memory_card_failed || status.memory_card_all_ready)
+    {
+        m_memcard_progress->setVisible(true);
+        if (status.memory_card_size == 0)
+        {
+            if (status.memory_card_transfer_active)
+            {
+                m_memcard_progress->setRange(0, 0);
+                m_memcard_progress->setFormat(tr("正在同步…"));
+            }
+            else
+            {
+                m_memcard_progress->setRange(0, 1000);
+                m_memcard_progress->setValue(status.memory_card_all_ready ? 1000 : 0);
+                m_memcard_progress->setFormat(status.memory_card_failed ? tr("同步失败") : tr("同步完成 ✓"));
+            }
+        }
+        else
+        {
+            m_memcard_progress->setRange(0, 1000);
+            const std::uint64_t done = std::min<std::uint64_t>(
+                status.memory_card_transferred_bytes, status.memory_card_size);
+            const int permille = static_cast<int>((done * 1000u) / status.memory_card_size);
+            m_memcard_progress->setValue(status.memory_card_all_ready ? 1000 : permille);
+            const double done_mb = static_cast<double>(done) / (1024.0 * 1024.0);
+            const double total_mb = static_cast<double>(status.memory_card_size) / (1024.0 * 1024.0);
+            const int percent = status.memory_card_all_ready ? 100 : (permille / 10);
+            m_memcard_progress->setFormat(status.memory_card_failed ?
+                tr("同步失败 · %1% · %2 / %3 MB").arg(percent).arg(done_mb, 0, 'f', 1).arg(total_mb, 0, 'f', 1) :
+                tr("%1% · %2 / %3 MB").arg(percent).arg(done_mb, 0, 'f', 1).arg(total_mb, 0, 'f', 1));
+        }
+    }
+    else
+    {
+        m_memcard_progress->setVisible(false);
+    }
+
+    if (status.memory_card_transfer_active)
+        m_last_memcard_error_shown.clear();
+
+    if (status.memory_card_failed && m_last_memcard_error_shown.isEmpty())
+    {
+        const QString error = QString::fromStdString(status.memory_card_status);
+        if (!error.isEmpty())
+        {
+            m_last_memcard_error_shown = error;
+            QMessageBox::warning(this, tr("记忆卡同步失败"),
+                tr("%1\n\n本次启动已取消，房间仍可继续使用。请检查网络后重新选择游戏开始；"
+                   "如果同一玩家反复失败，可先点“重建连接”。").arg(error));
+        }
+    }
 
     if (!status.start_requested)
         m_boot_status->setText(tr("等待房主选择游戏。"));

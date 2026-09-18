@@ -52,10 +52,11 @@ namespace
     constexpr std::uint32_t INPUT_MAGIC = 0x494E5054;   // INPT
     constexpr std::uint32_t BUNDLE_MAGIC = 0x424E444C;  // BNDL
     constexpr std::uint32_t CONTROL_MAGIC = 0x43544C31; // CTL1
-    constexpr std::uint32_t PROTOCOL_VERSION = 7;
+    constexpr std::uint32_t PROTOCOL_VERSION = 8;
     constexpr std::uint16_t DEFAULT_PORT = 27886;
     constexpr int RECEIVE_TIMEOUT_SECONDS = 30;
     constexpr int BOOT_BARRIER_TIMEOUT_SECONDS = 90;
+    constexpr DWORD SOCKET_SEND_TIMEOUT_MS = 8000;
     constexpr std::uint32_t LOG_FRAME_INTERVAL = 120;
     constexpr std::uint32_t MAX_CONTROL_PAYLOAD = 64 * 1024;
     constexpr std::uint32_t MEMCARD_CHUNK = 60 * 1024;
@@ -100,6 +101,7 @@ namespace
         RuntimeAck = 16,
         RuntimeCommit = 17,
         SyncCheckpoint = 18,
+        MemcardAbort = 19,
     };
 
     struct PlayerState
@@ -237,6 +239,17 @@ namespace
         return ioctlsocket(socket, FIONBIO, &nonblocking) == 0;
     }
 
+    void ConfigureConnectedSocket(SOCKET socket)
+    {
+        BOOL no_delay = TRUE;
+        setsockopt(socket, IPPROTO_TCP, TCP_NODELAY,
+            reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
+
+        const DWORD send_timeout = SOCKET_SEND_TIMEOUT_MS;
+        setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO,
+            reinterpret_cast<const char*>(&send_timeout), sizeof(send_timeout));
+    }
+
     std::string TruncateUtf8(const std::string& value, std::size_t max_bytes)
     {
         if (value.size() <= max_bytes)
@@ -354,8 +367,12 @@ namespace
             out.memory_card_local_ready = m_memory_card_local_ready;
             out.memory_card_all_ready = AllMemcardsReadyLocked();
             out.memory_card_present = m_memory_card_present;
+            out.memory_card_transfer_active = m_memory_card_transfer_active;
+            out.memory_card_failed = m_memory_card_failed;
             out.memory_card_crc = m_memory_card_crc;
             out.memory_card_size = m_memory_card_size;
+            out.memory_card_transferred_bytes =
+                (m_role == Role::Host) ? m_memory_card_transferred_bytes : m_memcard_received_bytes;
             out.memory_card_status = m_memory_card_status;
 
             out.start_requested = m_start_requested;
@@ -886,8 +903,13 @@ namespace
             m_memcard_transfer_started = false;
             m_memory_card_local_ready = false;
             m_memory_card_present = false;
+            m_memory_card_transfer_active = false;
+            m_memory_card_failed = false;
             m_memory_card_crc = 0;
             m_memory_card_size = 0;
+            m_memory_card_transferred_bytes = 0;
+            m_memcard_received_bytes = 0;
+            m_memcard_receive.clear();
             m_memory_card_status = m_memory_card_sync_enabled ? "等待记忆卡同步" : "记忆卡同步已关闭";
             m_shadow_card_filename.clear();
             m_prepare_boot = false;
@@ -1096,8 +1118,7 @@ namespace
                 if (socket_value == INVALID_SOCKET)
                     continue;
 
-                BOOL no_delay = TRUE;
-                setsockopt(socket_value, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
+                ConfigureConnectedSocket(socket_value);
 
                 std::uint32_t player_id = 0;
                 std::string player_name;
@@ -1178,8 +1199,7 @@ namespace
                     freeaddrinfo(result);
                     if (connected != INVALID_SOCKET)
                     {
-                        BOOL no_delay = TRUE;
-                        setsockopt(connected, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
+                        ConfigureConnectedSocket(connected);
                         if (ClientHandshake(connected))
                         {
                             {
@@ -1268,17 +1288,43 @@ namespace
                 SendControlRaw(peer.socket, peer.send_mutex, type, payload, size);
         }
 
-        void BroadcastControl(ControlType type, const void* payload, std::uint32_t size)
+        bool BroadcastControlChecked(ControlType type, const void* payload, std::uint32_t size,
+            std::uint32_t* failed_player = nullptr, std::uint32_t skip_player = 0)
         {
+            bool ok = true;
+            if (failed_player)
+                *failed_player = 0;
+
             std::lock_guard<std::mutex> lock(m_peer_mutex);
             for (auto& peer : m_peers)
             {
-                if (peer && peer->connected.load(std::memory_order_acquire))
+                if (!peer || !peer->connected.load(std::memory_order_acquire) || peer->player_id == skip_player)
+                    continue;
+
+                if (!SendControlToPeer(*peer, type, payload, size))
                 {
-                    if (!SendControlToPeer(*peer, type, payload, size))
-                        Log("warning: failed control send to P%u", static_cast<unsigned>(peer->player_id));
+                    Log("warning: failed control send to P%u type=%u winsock=%d",
+                        static_cast<unsigned>(peer->player_id),
+                        static_cast<unsigned>(type), WSAGetLastError());
+                    if (failed_player && *failed_player == 0)
+                        *failed_player = peer->player_id;
+                    ok = false;
                 }
             }
+            return ok;
+        }
+
+        void BroadcastControl(ControlType type, const void* payload, std::uint32_t size)
+        {
+            BroadcastControlChecked(type, payload, size);
+        }
+
+        void BroadcastMemoryCardAbort(const std::string& reason, std::uint32_t skip_player = 0)
+        {
+            const std::size_t size = std::min<std::size_t>(reason.size(), MAX_CONTROL_PAYLOAD);
+            BroadcastControlChecked(ControlType::MemcardAbort,
+                size > 0 ? reinterpret_cast<const std::uint8_t*>(reason.data()) : nullptr,
+                static_cast<std::uint32_t>(size), nullptr, skip_player);
         }
 
         void BroadcastRoster()
@@ -1555,15 +1601,37 @@ namespace
             return true;
         }
 
-        void CancelPendingStart(const std::string& message)
+        void CancelPendingStart(const std::string& message, std::uint32_t skip_notify_player = 0)
         {
+            std::uint32_t total = 0;
+            std::uint64_t transferred = 0;
+            bool present = false;
+            std::string shadow_to_remove;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
+                total = m_memory_card_size;
+                transferred = m_memory_card_transferred_bytes;
+                present = m_memory_card_present;
+                shadow_to_remove = m_shadow_card_filename;
                 ResetStartStateLocked();
+                m_memory_card_present = present;
+                m_memory_card_size = total;
+                m_memory_card_transferred_bytes = transferred;
+                m_memory_card_transfer_active = false;
+                m_memory_card_failed = true;
                 m_last_error = message;
                 m_memory_card_status = message;
             }
+
+            if (!shadow_to_remove.empty())
+            {
+                const std::string shadow_path = Path::Combine(EmuFolders::MemoryCards, shadow_to_remove);
+                FileSystem::DeleteFilePath(shadow_path.c_str());
+            }
+
             Log("START_CANCELLED: %s", message.c_str());
+            if (m_role == Role::Host)
+                BroadcastMemoryCardAbort(message, skip_notify_player);
             BroadcastRoster();
         }
 
@@ -1591,18 +1659,31 @@ namespace
                 m_memory_card_present = present;
                 m_memory_card_crc = hash;
                 m_memory_card_size = static_cast<std::uint32_t>(data.size());
+                m_memory_card_transferred_bytes = 0;
+                m_memory_card_transfer_active = true;
+                m_memory_card_failed = false;
                 m_shadow_card_filename = shadow;
                 m_memory_card_local_ready = true;
                 m_players[0].memcard_ready = true;
-                m_memory_card_status = present ? "房主临时记忆卡已创建，正在同步给其他玩家" : "房主未插入记忆卡，已同步为无卡状态";
+                m_memory_card_status = present ?
+                    "正在发送房主记忆卡临时副本" : "房主未插入记忆卡，正在同步无卡状态";
             }
 
             std::array<std::uint8_t, 16> begin{};
             WriteU32(begin.data(), present ? 1u : 0u);
             WriteU32(begin.data() + 4, static_cast<std::uint32_t>(data.size()));
             WriteU64(begin.data() + 8, hash);
-            BroadcastControl(ControlType::MemcardBegin, begin.data(), static_cast<std::uint32_t>(begin.size()));
 
+            std::uint32_t failed_player = 0;
+            if (!BroadcastControlChecked(ControlType::MemcardBegin, begin.data(),
+                    static_cast<std::uint32_t>(begin.size()), &failed_player))
+            {
+                CancelPendingStart("向玩家 P" + std::to_string(failed_player) +
+                    " 发送记忆卡同步信息超时或失败，请检查连接后重试", failed_player);
+                return;
+            }
+
+            std::uint32_t last_logged_percent = 0;
             for (std::uint32_t offset = 0; offset < data.size(); offset += MEMCARD_CHUNK)
             {
                 const std::uint32_t chunk_size = std::min<std::uint32_t>(MEMCARD_CHUNK,
@@ -1610,12 +1691,57 @@ namespace
                 std::vector<std::uint8_t> chunk(4u + chunk_size);
                 WriteU32(chunk.data(), offset);
                 std::memcpy(chunk.data() + 4, data.data() + offset, chunk_size);
-                BroadcastControl(ControlType::MemcardChunk, chunk.data(), static_cast<std::uint32_t>(chunk.size()));
+
+                failed_player = 0;
+                if (!BroadcastControlChecked(ControlType::MemcardChunk, chunk.data(),
+                        static_cast<std::uint32_t>(chunk.size()), &failed_player))
+                {
+                    CancelPendingStart("向玩家 P" + std::to_string(failed_player) +
+                        " 发送记忆卡数据超时或失败，本次启动已取消；请检查该玩家网络后重试",
+                        failed_player);
+                    return;
+                }
+
+                const std::uint64_t completed = static_cast<std::uint64_t>(offset) + chunk_size;
+                {
+                    std::lock_guard<std::mutex> lock(m_state_mutex);
+                    m_memory_card_transferred_bytes = completed;
+                }
+
+                if (!data.empty())
+                {
+                    const std::uint32_t percent =
+                        static_cast<std::uint32_t>((completed * 100u) / data.size());
+                    if (percent >= last_logged_percent + 10u || percent == 100u)
+                    {
+                        last_logged_percent = percent;
+                        Log("memory card send progress: %u%% (%llu/%u bytes)",
+                            static_cast<unsigned>(percent),
+                            static_cast<unsigned long long>(completed),
+                            static_cast<unsigned>(data.size()));
+                    }
+                }
             }
-            BroadcastControl(ControlType::MemcardEnd, nullptr, 0);
+
+            failed_player = 0;
+            if (!BroadcastControlChecked(ControlType::MemcardEnd, nullptr, 0, &failed_player))
+            {
+                CancelPendingStart("向玩家 P" + std::to_string(failed_player) +
+                    " 发送记忆卡结束标记失败，本次启动已取消", failed_player);
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                m_memory_card_transferred_bytes = data.size();
+                m_memory_card_status = present ?
+                    "记忆卡发送完成，等待其他玩家校验" : "无卡状态已发送，等待其他玩家确认";
+            }
+
             BroadcastRoster();
             Log("memory card shadow prepared: present=%s size=%u hash=%016llX",
-                present ? "yes" : "no", static_cast<unsigned>(data.size()), static_cast<unsigned long long>(hash));
+                present ? "yes" : "no", static_cast<unsigned>(data.size()),
+                static_cast<unsigned long long>(hash));
             MaybeAdvanceStart();
         }
 
@@ -1637,8 +1763,10 @@ namespace
             m_memory_card_size = size;
             m_memcard_receive.assign(size, 0);
             m_memcard_received_bytes = 0;
+            m_memory_card_transfer_active = true;
+            m_memory_card_failed = false;
             m_memory_card_local_ready = false;
-            m_memory_card_status = present ? "正在接收房主记忆卡临时副本" : "房主未插入记忆卡";
+            m_memory_card_status = present ? "正在接收房主记忆卡临时副本" : "正在接收房主无卡状态";
         }
 
         void HandleClientMemcardChunk(const std::vector<std::uint8_t>& payload)
@@ -1650,7 +1778,10 @@ namespace
             std::lock_guard<std::mutex> lock(m_state_mutex);
             if (offset > m_memcard_receive.size() || size > (m_memcard_receive.size() - offset))
             {
-                m_last_error = "记忆卡数据块越界";
+                m_memory_card_transfer_active = false;
+                m_memory_card_failed = true;
+                m_last_error = "记忆卡同步失败：收到的数据块越界";
+                m_memory_card_status = m_last_error;
                 return;
             }
             if (size > 0)
@@ -1680,10 +1811,14 @@ namespace
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 m_memory_card_local_ready = ok;
+                m_memory_card_transfer_active = false;
+                m_memory_card_failed = !ok;
                 m_shadow_card_filename = ok ? shadow : std::string();
                 if (m_local_player_id >= 1 && m_local_player_id <= MAX_PLAYERS)
                     m_players[m_local_player_id - 1].memcard_ready = ok;
-                m_memory_card_status = ok ? (present ? "记忆卡同步完成 ✓（使用联机临时副本）" : "无记忆卡状态同步完成 ✓") : "记忆卡同步失败";
+                m_memory_card_status = ok ?
+                    (present ? "记忆卡同步完成 ✓（使用联机临时副本）" : "无记忆卡状态同步完成 ✓") :
+                    "记忆卡同步失败：大小或校验值不一致";
                 m_memcard_receive.clear();
             }
 
@@ -1695,9 +1830,43 @@ namespace
                 static_cast<unsigned>(data.size()), static_cast<unsigned long long>(actual));
             if (!ok)
             {
-                SetLastError("记忆卡同步失败，可在房间中重新选择游戏重试");
+                SetLastError("记忆卡同步失败：大小或校验值不一致，可在房间中重新选择游戏重试");
                 Log("memory card synchronization failed; lobby remains open for retry");
             }
+        }
+
+        void HandleClientMemcardAbort(const std::vector<std::uint8_t>& payload)
+        {
+            const std::string reason = payload.empty() ? "房主取消了本次记忆卡同步" :
+                std::string(reinterpret_cast<const char*>(payload.data()), payload.size());
+
+            std::string shadow_to_remove;
+            std::uint32_t total = 0;
+            std::uint64_t received = 0;
+            bool present = false;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                total = m_memory_card_size;
+                received = m_memcard_received_bytes;
+                present = m_memory_card_present;
+                shadow_to_remove = m_shadow_card_filename;
+                ResetStartStateLocked();
+                m_memory_card_present = present;
+                m_memory_card_size = total;
+                m_memcard_received_bytes = received;
+                m_memory_card_transfer_active = false;
+                m_memory_card_failed = true;
+                m_memory_card_status = reason;
+                m_last_error = reason;
+            }
+
+            if (!shadow_to_remove.empty())
+            {
+                const std::string shadow_path = Path::Combine(EmuFolders::MemoryCards, shadow_to_remove);
+                FileSystem::DeleteFilePath(shadow_path.c_str());
+            }
+
+            Log("MEMCARD_ABORT received: %s", reason.c_str());
         }
 
         void MaybeAdvanceStart()
@@ -2698,6 +2867,12 @@ namespace
                         std::lock_guard<std::mutex> lock(m_state_mutex);
                         accepted = ok && (hash == m_memory_card_crc);
                         m_players[peer.player_id - 1].memcard_ready = accepted;
+                        if (accepted && AllMemcardsReadyLocked())
+                        {
+                            m_memory_card_transfer_active = false;
+                            m_memory_card_failed = false;
+                            m_memory_card_status = "全员记忆卡同步完成 ✓";
+                        }
                     }
                     Log("P%u MEMCARD_READY=%s hash=%016llX", static_cast<unsigned>(peer.player_id),
                         accepted ? "yes" : "no", static_cast<unsigned long long>(hash));
@@ -2787,6 +2962,9 @@ namespace
                     break;
                 case ControlType::MemcardEnd:
                     HandleClientMemcardEnd();
+                    break;
+                case ControlType::MemcardAbort:
+                    HandleClientMemcardAbort(payload);
                     break;
                 case ControlType::PrepareBoot:
                     HandleClientPrepareBoot();
@@ -2895,8 +3073,11 @@ namespace
         bool m_memcard_transfer_started = false;
         bool m_memory_card_local_ready = false;
         bool m_memory_card_present = false;
+        bool m_memory_card_transfer_active = false;
+        bool m_memory_card_failed = false;
         std::uint64_t m_memory_card_crc = 0;
         std::uint32_t m_memory_card_size = 0;
+        std::uint64_t m_memory_card_transferred_bytes = 0;
         std::string m_memory_card_status = "等待记忆卡同步";
         std::string m_shadow_card_filename;
         std::vector<std::uint8_t> m_memcard_receive;
