@@ -187,7 +187,7 @@ void NetplayDialog::buildSetupUi()
     m_memcard_sync->setChecked(true);
     host_form->addRow(QString(), m_memcard_sync);
 
-    auto* host_note = new QLabel(tr("3～4 人房间会自动启用 Multitap。游戏开始后会锁定房间，所有玩家必须使用相同 Serial + CRC 的游戏。"), host_tab);
+    auto* host_note = new QLabel(tr("3～4 人房间会自动在 2 号手柄端口启用 Multitap，保持 P1/P2 与双人模式一致，P3/P4 使用扩展槽位。游戏开始后会锁定房间，所有玩家必须使用相同 Serial + CRC 的游戏。"), host_tab);
     host_note->setWordWrap(true);
     host_form->addRow(QString(), host_note);
 

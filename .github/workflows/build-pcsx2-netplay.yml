@@ -108,14 +108,18 @@ jobs:
           $channel = if ($env:GITHUB_REF -eq "refs/heads/master") { "stable" } else { "test" }
           $channel | Set-Content -Encoding ASCII src\bin\NETPLAY_UPDATE_CHANNEL.txt
           @"
-          PCSX2 Modern Netplay v0.5b-r6 delay-100 + protected Netplay updater
+          PCSX2 Modern Netplay v0.5b-r7 3-4P START-join topology fix
           =================================================
           Base: current PCSX2 master at build time (exact SHA in PCSX2_UPSTREAM_SHA.txt)
-          Protocol: v4 host-authoritative multiplayer + full 18-byte DualShock2 input + synchronized boot
+          Protocol: v5 host-authoritative multiplayer + full 18-byte DualShock2 input + synchronized boot
           Transport: reliable TCP
           Default port: 27886/TCP
 
           Included in this single test build:
+          - v0.5b-r7: fix 3P/4P games which require START to join by preserving P2 on normal controller port 2.
+          - v0.5b-r7: move the 3P/4P Multitap to controller port 2; mapping is now P1=0, P2=1, P3=5, P4=6.
+          - v0.5b-r7: protocol bumped to v5 so older slot-topology builds cannot silently mix with this build.
+          - v0.5b-r7: this follows the legacy PCSX2 Online pad ordering, while keeping the already-working 1P/2P behavior unchanged.
           - v0.5b-r6: input-delay range raised from 1-12 to 1-100 frames on host and client protocol validation.
           - v0.5b-r6: input/bundle history retention now scales with selected delay so 100-frame rooms do not prune needed frames.
           - v0.5b-r6: stock PCSX2 automatic/manual updater is hard-disabled in the custom Netplay binary.
@@ -148,7 +152,7 @@ jobs:
           - Strict Serial + CRC matching on every player before launch.
           - Synchronized PREPARE_BOOT / BOOT_READY / START_COMMIT / FIRST_POLL_GO barriers.
           - 1-4 player rooms. P1 is host; P2-P4 are network clients.
-          - 3-4 player rooms automatically enable Multitap and use PCSX2 slots 0,2,3,4.
+          - 3-4 player rooms automatically enable Multitap on controller port 2 and use PCSX2 slots P1=0, P2=1, P3=5, P4=6.
           - Host-authoritative input bundles: every poll waits for all configured players, then the same bundle is broadcast to every PC.
           - Shadow memory-card synchronization. Host slot 1 is exported before boot and transferred to every player.
           - Both host and clients run from NetplayShadow-<session>.ps2, so the user's original card is not overwritten by the Netplay session.
@@ -201,7 +205,7 @@ jobs:
       - name: Upload Windows x64 Netplay build
         uses: actions/upload-artifact@v4
         with:
-          name: PCSX2-modern-netplay-windows-x64-v0.5b-r6
+          name: PCSX2-modern-netplay-windows-x64-v0.5b-r7
           path: src/bin
           if-no-files-found: error
           retention-days: 14
@@ -214,7 +218,7 @@ jobs:
           Compress-Archive -Path src\bin\* -DestinationPath $archive -CompressionLevel Optimal
           $channel = if ($env:GITHUB_REF -eq "refs/heads/master") { "stable" } else { "test" }
           $manifest = [ordered]@{
-            version = "v0.5b-r6"
+            version = "v0.5b-r7"
             channel = $channel
             control_sha = (Get-Content control\NETPLAY_CONTROL_SHA.txt -Raw).Trim()
             upstream_sha = (Get-Content control\PCSX2_UPSTREAM_SHA.txt -Raw).Trim()
@@ -261,7 +265,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir recovered
-          gh run download 35336516275 -n PCSX2-modern-netplay-windows-x64-v0.5b-r6 -D recovered
+          gh run download 35336516275 -n PCSX2-modern-netplay-windows-x64-v0.5b-r7 -D recovered
           test -f recovered/pcsx2-qt.exe
           test -f recovered/NETPLAY_CONTROL_SHA.txt
           test -f recovered/PCSX2_UPSTREAM_SHA.txt
@@ -271,7 +275,7 @@ jobs:
         run: |
           Compress-Archive -Path recovered/* -DestinationPath "$env:RUNNER_TEMP/PCSX2-modern-netplay-windows-x64.zip" -CompressionLevel Optimal
           $manifest = [ordered]@{
-            version = "v0.5b-r6"
+            version = "v0.5b-r7"
             channel = "test"
             control_sha = (Get-Content recovered/NETPLAY_CONTROL_SHA.txt -Raw).Trim()
             upstream_sha = (Get-Content recovered/PCSX2_UPSTREAM_SHA.txt -Raw).Trim()

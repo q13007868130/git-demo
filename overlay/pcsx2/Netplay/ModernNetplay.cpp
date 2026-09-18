@@ -51,7 +51,7 @@ namespace
     constexpr std::uint32_t INPUT_MAGIC = 0x494E5054;   // INPT
     constexpr std::uint32_t BUNDLE_MAGIC = 0x424E444C;  // BNDL
     constexpr std::uint32_t CONTROL_MAGIC = 0x43544C31; // CTL1
-    constexpr std::uint32_t PROTOCOL_VERSION = 4;
+    constexpr std::uint32_t PROTOCOL_VERSION = 5;
     constexpr std::uint16_t DEFAULT_PORT = 27886;
     constexpr int RECEIVE_TIMEOUT_SECONDS = 30;
     constexpr int BOOT_BARRIER_TIMEOUT_SECONDS = 90;
@@ -477,13 +477,17 @@ namespace
         {
             if (!IsConfigured())
                 return false;
-            const std::uint32_t players = m_max_players;
-            if (players <= 2)
-                return slot < players;
+
+            // Stable topology across 1-4 players:
+            // P1=0, P2=1, P3=5, P4=6.
             if (slot == 0)
-                return true;
-            if (slot >= 2 && slot <= 4)
-                return (slot - 1) < players;
+                return m_max_players >= 1;
+            if (slot == 1)
+                return m_max_players >= 2;
+            if (slot == 5)
+                return m_max_players >= 3;
+            if (slot == 6)
+                return m_max_players >= 4;
             return false;
         }
 
@@ -497,8 +501,16 @@ namespace
             if (!IsConfigured())
                 return;
 
-            EmuConfig.Pad.MultitapPort0_Enabled = (m_max_players >= 3);
-            EmuConfig.Pad.MultitapPort1_Enabled = false;
+            // Preserve P2 on the normal second controller port and expand
+            // P3/P4 from the Multitap attached to controller port 2.
+            // This matches the legacy PCSX2 Online pad layout and fixes games
+            // which require P2/P3/P4 to press START to join.
+            EmuConfig.Pad.MultitapPort0_Enabled = false;
+            EmuConfig.Pad.MultitapPort1_Enabled = (m_max_players >= 3);
+
+            if (m_max_players >= 3)
+                Log("pad topology: P1=slot0 P2=slot1 P3=slot5%s; multitap=controller-port-2",
+                    (m_max_players >= 4) ? " P4=slot6" : "");
 
             std::string shadow_name;
             bool memcard_ready = false;
@@ -833,19 +845,23 @@ namespace
 
         int SlotToPlayerIndex(std::uint32_t slot) const
         {
-            if (m_max_players <= 2)
-            {
-                if (slot < m_max_players)
-                    return static_cast<int>(slot);
-                return -1;
-            }
+            // Keep the proven 1P/2P topology unchanged:
+            //   P1 = controller port 1 slot A -> unified 0
+            //   P2 = controller port 2 slot A -> unified 1
+            //
+            // For 3P/4P, attach the Multitap to controller port 2 so P2
+            // remains on the same logical pad that 2-player games expect.
+            // PCSX2 then exposes additional port-2 Multitap pads as 5, 6, 7:
+            //   P3 = unified 5
+            //   P4 = unified 6
             if (slot == 0)
                 return 0;
-            if (slot >= 2 && slot <= 4)
-            {
-                const std::uint32_t index = slot - 1;
-                return (index < m_max_players) ? static_cast<int>(index) : -1;
-            }
+            if (m_max_players >= 2 && slot == 1)
+                return 1;
+            if (m_max_players >= 3 && slot == 5)
+                return 2;
+            if (m_max_players >= 4 && slot == 6)
+                return 3;
             return -1;
         }
 
