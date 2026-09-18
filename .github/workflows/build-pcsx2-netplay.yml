@@ -16,6 +16,7 @@ permissions:
 
 jobs:
   windows-x64:
+    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[release-only]') }}
     runs-on: windows-2025
     timeout-minutes: 120
     env:
@@ -222,6 +223,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: q13007868130/git-demo
         run: |
           $channel = if ($env:GITHUB_REF -eq "refs/heads/master") { "stable" } else { "test" }
           $tag = if ($channel -eq "stable") { "netplay-latest" } else { "netplay-test-latest" }
@@ -236,3 +238,49 @@ jobs:
           } else {
             gh release create $tag "$env:RUNNER_TEMP\PCSX2-modern-netplay-windows-x64.zip" "$env:RUNNER_TEMP\NETPLAY_UPDATE_MANIFEST.json" --target "$env:GITHUB_SHA" --title "PCSX2 Modern Netplay Latest" --notes $notes
           }
+
+
+  release-only-repair:
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[release-only]') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Recover successful r5 artifact from Build 24
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: q13007868130/git-demo
+        run: |
+          set -euo pipefail
+          mkdir recovered
+          gh run download 35336516275 -n PCSX2-modern-netplay-windows-x64-v0.5b-r5 -D recovered
+          test -f recovered/pcsx2-qt.exe
+          test -f recovered/NETPLAY_CONTROL_SHA.txt
+          test -f recovered/PCSX2_UPSTREAM_SHA.txt
+
+      - name: Rebuild rolling update archive and manifest
+        shell: pwsh
+        run: |
+          Compress-Archive -Path recovered/* -DestinationPath "$env:RUNNER_TEMP/PCSX2-modern-netplay-windows-x64.zip" -CompressionLevel Optimal
+          $manifest = [ordered]@{
+            version = "v0.5b-r5"
+            channel = "test"
+            control_sha = (Get-Content recovered/NETPLAY_CONTROL_SHA.txt -Raw).Trim()
+            upstream_sha = (Get-Content recovered/PCSX2_UPSTREAM_SHA.txt -Raw).Trim()
+            sha256 = (Get-FileHash -Algorithm SHA256 "$env:RUNNER_TEMP/PCSX2-modern-netplay-windows-x64.zip").Hash
+            asset_name = "PCSX2-modern-netplay-windows-x64.zip"
+            published_at = (Get-Date).ToUniversalTime().ToString("o")
+          }
+          $manifest | ConvertTo-Json | Set-Content -Encoding utf8 "$env:RUNNER_TEMP/NETPLAY_UPDATE_MANIFEST.json"
+
+      - name: Publish repaired rolling test update
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: q13007868130/git-demo
+        run: |
+          set -euo pipefail
+          gh release view netplay-test-latest >/dev/null 2>&1 && gh release delete netplay-test-latest --cleanup-tag -y || true
+          gh release create netplay-test-latest             "$RUNNER_TEMP/PCSX2-modern-netplay-windows-x64.zip"             "$RUNNER_TEMP/NETPLAY_UPDATE_MANIFEST.json"             --target 4d67eafe523d449d4404f546f1c290c2ee34e490             --title "PCSX2 Modern Netplay Test Update"             --notes "Recovered v0.5b-r5 build. Rolling updater publication repaired."             --prerelease
