@@ -876,7 +876,7 @@ namespace
 
         bool AllGamesMatchLocked() const
         {
-            if (!m_game_selected || RoundRoundConnectedCountLocked() != m_max_players)
+            if (!m_game_selected || RoundConnectedCountLocked() != m_max_players)
                 return false;
             for (std::uint32_t i = 0; i < m_max_players; i++)
             {
@@ -1139,7 +1139,7 @@ namespace
                 return;
             }
 
-            Log("room open: TCP port %u, capacity=%u", static_cast<unsigned>(m_port), static_cast<unsigned>(m_max_players));
+            Log("room open: TCP port %u, capacity=%u", static_cast<unsigned>(m_port), static_cast<unsigned>(m_room_capacity));
             while (!m_stop_requested.load(std::memory_order_acquire))
             {
                 {
@@ -2850,7 +2850,8 @@ namespace
             bool cancelled_pending_start = false;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
-                fatal_disconnect = m_prepare_boot || m_start_committed;
+                fatal_disconnect = (dropped_player_id <= m_max_players) &&
+                    (m_prepare_boot || m_start_committed);
                 if (dropped_player_id >= 1 && dropped_player_id <= MAX_PLAYERS)
                     m_players[dropped_player_id - 1] = PlayerState{};
 

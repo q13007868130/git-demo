@@ -538,7 +538,11 @@ void NetplayDialog::refreshLobby()
             tr("房间已就绪 · %1 / %2 人 · 输入延迟 %3 帧")
                 .arg(status.player_count).arg(status.max_players).arg(status.delay));
     else if (is_host)
-        m_room_status->setText(tr("等待玩家加入… · %1 / %2 人 · TCP %3").arg(status.player_count).arg(status.max_players).arg(status.port));
+        m_room_status->setText(status.round_in_progress ?
+            tr("本局 %1 人继续进行 · 房间已开放到 %2 人 · 等待新玩家加入… · TCP %3")
+                .arg(status.round_players).arg(status.max_players).arg(status.port) :
+            tr("等待玩家加入… · %1 / %2 人 · TCP %3")
+                .arg(status.player_count).arg(status.max_players).arg(status.port));
     else if (status.connected)
         m_room_status->setText(tr("已连接房主，等待其他玩家… · %1 / %2 人").arg(status.player_count).arg(status.max_players));
     else
@@ -649,6 +653,19 @@ void NetplayDialog::refreshLobby()
         m_boot_status->setText(tr("已统一启动，正在等待第一个手柄同步点…"));
     else
         m_boot_status->setText(tr("同步启动完成 ✓"));
+
+    if (m_local_controller && m_local_controller->count() != static_cast<int>(status.max_players))
+    {
+        const int previous = m_local_controller->currentData().toInt();
+        m_local_controller->blockSignals(true);
+        m_local_controller->clear();
+        for (std::uint32_t i = 1; i <= status.max_players; i++)
+            m_local_controller->addItem(tr("P%1").arg(i), static_cast<int>(i));
+        const int restored = m_local_controller->findData(previous);
+        if (restored >= 0)
+            m_local_controller->setCurrentIndex(restored);
+        m_local_controller->blockSignals(false);
+    }
 
     const std::uint32_t local_controller =
         (status.local_player_id >= 1 && status.local_player_id <= ModernNetplay::MAX_PLAYERS) ?
