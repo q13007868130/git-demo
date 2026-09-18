@@ -95,7 +95,8 @@ endif()
 }
 Write-Text $coreCmake $text
 
-# Runtime deterministic settings: multitap + shadow memory card are applied here.
+# Runtime deterministic settings: normalize per-machine core/timing settings first,
+# then let PCSX2's shared game-database overrides apply identically on every peer.
 $text = Read-Text $vmManager
 if ($text -notmatch '#include "Netplay/ModernNetplay.h"') {
     $needle = '#include "VMManager.h"'
@@ -105,7 +106,7 @@ if ($text -notmatch '#include "Netplay/ModernNetplay.h"') {
 if ($text -notmatch 'ModernNetplay::ApplyDeterministicConfig\(\)') {
     $needle = "`tPatch::ApplyPatchSettingOverrides();"
     if (-not $text.Contains($needle)) { throw 'VMManager.cpp LoadCoreSettings anchor not found' }
-    $text = $text.Replace($needle, "$needle`r`n`tModernNetplay::ApplyDeterministicConfig();")
+    $text = $text.Replace($needle, "`tModernNetplay::ApplyDeterministicConfig();`r`n$needle")
 }
 Write-Text $vmManager $text
 
