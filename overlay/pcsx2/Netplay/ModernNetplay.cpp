@@ -538,13 +538,25 @@ namespace
             EmuConfig.EmulationSpeed.UseVSyncForTiming = false;
             EmuConfig.GS.FramerateNTSC = Pcsx2Config::GSOptions::DEFAULT_FRAME_RATE_NTSC;
             EmuConfig.GS.FrameratePAL = Pcsx2Config::GSOptions::DEFAULT_FRAME_RATE_PAL;
+            EmuConfig.EnablePatches = true;
+            EmuConfig.EnableGameFixes = true;
             EmuConfig.EnableCheats = false;
             EmuConfig.EnableWideScreenPatches = false;
             EmuConfig.EnableNoInterlacingPatches = false;
             EmuConfig.EnableFastBoot = true;
 
+            // The PS2 RTC is visible to games. Using each PC's wall clock can make
+            // otherwise identical VMs take different branches, so Netplay pins it.
+            EmuConfig.ManuallySetRealTimeClock = true;
+            EmuConfig.RtcYear = 0;   // PCSX2 interprets this as year 2000.
+            EmuConfig.RtcMonth = 1;
+            EmuConfig.RtcDay = 1;
+            EmuConfig.RtcHour = 0;
+            EmuConfig.RtcMinute = 0;
+            EmuConfig.RtcSecond = 0;
+
             Log("deterministic core normalized: CPU=default speedhacks=off nominal=100%% "
-                "NTSC=%.2f PAL=%.2f cheats=off widescreen=off nointerlace=off",
+                "NTSC=%.2f PAL=%.2f gamedb=on gamefixes=on local-cheats=off local-patches=off rtc=2000-01-01",
                 static_cast<double>(EmuConfig.GS.FramerateNTSC),
                 static_cast<double>(EmuConfig.GS.FrameratePAL));
 

@@ -25,6 +25,7 @@ $padCpp     = Join-Path $SourceRoot 'pcsx2\SIO\Pad\Pad.cpp'
 $ds2Cpp     = Join-Path $SourceRoot 'pcsx2\SIO\Pad\PadDualshock2.cpp'
 $coreCmake  = Join-Path $SourceRoot 'pcsx2\CMakeLists.txt'
 $vmManager  = Join-Path $SourceRoot 'pcsx2\VMManager.cpp'
+$patchCpp   = Join-Path $SourceRoot 'pcsx2\Patch.cpp'
 $mainWindow = Join-Path $SourceRoot 'pcsx2-qt\MainWindow.cpp'
 $autoUpdater = Join-Path $SourceRoot 'pcsx2-qt\AutoUpdaterDialog.cpp'
 $qtHost     = Join-Path $SourceRoot 'pcsx2-qt\QtHost.cpp'
@@ -109,6 +110,30 @@ if ($text -notmatch 'ModernNetplay::ApplyDeterministicConfig\(\)') {
     $text = $text.Replace($needle, "`tModernNetplay::ApplyDeterministicConfig();`r`n$needle")
 }
 Write-Text $vmManager $text
+
+# Netplay determinism: keep PCSX2's shared GameDB compatibility patches, but do
+# not let machine-local PNACH patch selections silently change emulated state.
+$text = Read-Text $patchCpp
+if ($text -notmatch '#include "Netplay/ModernNetplay.h"') {
+    $needle = '#include "Memory.h"'
+    if (-not $text.Contains($needle)) { throw 'Patch.cpp include anchor not found' }
+    $text = $text.Replace($needle, "$needle`r`n#include `"Netplay/ModernNetplay.h`"")
+}
+if ($text -notmatch 'PCSX2_MODERN_NETPLAY_PATCH_GUARD') {
+    $oldPatchEnable = @'
+	const u32 p_count = EnablePatches(
+		&s_game_patches, s_enabled_patches, apply_new_patches ? &s_just_enabled_patches : nullptr);
+'@
+    $newPatchEnable = @'
+	// PCSX2_MODERN_NETPLAY_PATCH_GUARD
+	// GameDB patches above remain enabled. Local/bundled optional PNACH groups
+	// are disabled in Netplay because their enable lists/files can differ per PC.
+	const u32 p_count = ModernNetplay::IsConfigured() ? 0u : EnablePatches(
+		&s_game_patches, s_enabled_patches, apply_new_patches ? &s_just_enabled_patches : nullptr);
+'@
+    $text = Replace-Portable $text $oldPatchEnable $newPatchEnable 'Patch.cpp active local-patch anchor not found'
+}
+Write-Text $patchCpp $text
 
 # Chinese first-class Netplay menu and automatic room reopen after restart.
 $text = Read-Text $mainWindow
