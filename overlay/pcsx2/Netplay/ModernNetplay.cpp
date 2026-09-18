@@ -670,7 +670,7 @@ namespace
                     m_port = static_cast<std::uint16_t>(value);
             }
             if (const char* delay = std::getenv("PCSX2_NETPLAY_DELAY"))
-                m_delay.store(static_cast<std::uint32_t>(std::clamp(std::atoi(delay), 1, 12)), std::memory_order_release);
+                m_delay.store(static_cast<std::uint32_t>(std::clamp(std::atoi(delay), 1, 100)), std::memory_order_release);
             if (const char* players = std::getenv("PCSX2_NETPLAY_PLAYERS"))
                 m_max_players = static_cast<std::uint32_t>(std::clamp(std::atoi(players), 1, 4));
             if (const char* sync = std::getenv("PCSX2_NETPLAY_MEMCARD_SYNC"))
@@ -950,7 +950,7 @@ namespace
                 m_players[assigned - 1].name = m_username;
                 m_last_error.clear();
             }
-            m_delay.store(std::clamp<std::uint32_t>(delay, 1, 12), std::memory_order_release);
+            m_delay.store(std::clamp<std::uint32_t>(delay, 1, 100), std::memory_order_release);
             return true;
         }
 
@@ -1975,9 +1975,13 @@ namespace
 
         void PruneInputHistory()
         {
-            if (m_frame < 180)
+            // Keep enough history for large user-selected delays plus jitter/stalls.
+            // With the new 100-frame ceiling, the old fixed 120-frame window was too tight.
+            const std::uint32_t delay = m_delay.load(std::memory_order_acquire);
+            const std::uint32_t keep_window = std::max<std::uint32_t>(240u, delay + 180u);
+            if (m_frame < keep_window)
                 return;
-            const std::uint32_t keep_from = m_frame - 120;
+            const std::uint32_t keep_from = m_frame - keep_window;
             {
                 std::lock_guard<std::mutex> lock(m_input_mutex);
                 for (auto& map : m_player_inputs)

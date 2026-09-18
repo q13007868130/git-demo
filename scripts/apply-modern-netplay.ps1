@@ -156,9 +156,7 @@ if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
 			QMessageBox::critical(this, tr("联机版更新"), tr("无法启动联机版更新器。"));
 	});
 
-	QAction* upstream_update = netplay_menu->addAction(tr("检查 PCSX2 官方更新（仅查看）..."));
-	connect(upstream_update, &QAction::triggered, this, [this]() { checkForUpdates(true, true); });
-	m_ui.actionCheckForUpdates->setText(tr("检查 PCSX2 官方更新（仅查看）..."));
+	m_ui.actionCheckForUpdates->setText(tr("检查联机版更新..."));
 
 	if (qEnvironmentVariableIsSet("PCSX2_NETPLAY_SHOW_LOBBY"))
 	{
@@ -172,14 +170,59 @@ if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
 }
 Write-Text $mainWindow $text
 
-# Protect the custom Netplay binary from the stock PCSX2 installer.
-# Official update checks remain available for information, but clicking
-# "Download and Install" cannot overwrite the custom Netplay executable.
+# Reroute PCSX2's stock Help -> Check for Updates action to the Netplay updater.
+# This is patched in connectSignals(), which runs after setupAdditionalUi().
+$text = Read-Text $mainWindow
+if ($text -notmatch 'PCSX2_MODERN_NETPLAY_UPDATE_ACTION') {
+    $old = 'connect(m_ui.actionCheckForUpdates, &QAction::triggered, this, [this]() { checkForUpdates(true, true); });'
+    if (-not $text.Contains($old)) { throw 'MainWindow.cpp stock update action anchor not found' }
+    $new = @'
+	// PCSX2_MODERN_NETPLAY_UPDATE_ACTION
+	connect(m_ui.actionCheckForUpdates, &QAction::triggered, this, [this]() {
+		QMessageBox::information(this, tr("PCSX2 Modern Netplay"),
+			tr("当前为联机修改版。官方原版更新会移除联机功能，因此已被禁用。\n\n"
+			   "接下来将检查联机版更新；联机版每次构建都会基于当时最新的 PCSX2 master。"));
+		if (QtHost::IsVMValid())
+		{
+			QMessageBox::information(this, tr("联机版更新"), tr("请先停止当前游戏，再进行联机版更新。"));
+			return;
+		}
+		const QString updater = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("Update-Netplay.bat"));
+		if (!QFileInfo::exists(updater))
+		{
+			QMessageBox::warning(this, tr("联机版更新"), tr("当前版本缺少联机更新器，请下载一次新版完整包。"));
+			return;
+		}
+		const QStringList args = {QStringLiteral("/c"), updater,
+			QString::number(QCoreApplication::applicationPid())};
+		if (!QProcess::startDetached(QStringLiteral("cmd.exe"), args, QCoreApplication::applicationDirPath()))
+			QMessageBox::critical(this, tr("联机版更新"), tr("无法启动联机版更新器。"));
+	});
+'@
+    $text = $text.Replace($old, $new)
+}
+Write-Text $mainWindow $text
+
+# Modern Netplay owns the update path completely.
+# The stock PCSX2 updater is disabled for this custom binary, including startup/background checks.
+# The stock Help -> Check for Updates action is rerouted to Update-Netplay.bat below.
 $text = Read-Text $autoUpdater
 if ($text -notmatch '#include "Netplay/ModernNetplay.h"') {
     $needle = '#include "AutoUpdaterDialog.h"'
     if (-not $text.Contains($needle)) { throw 'AutoUpdaterDialog.cpp include anchor not found' }
     $text = $text.Replace($needle, "$needle`r`n#include `"Netplay/ModernNetplay.h`"")
+}
+if ($text -notmatch 'PCSX2_MODERN_NETPLAY_DISABLE_STOCK_UPDATER') {
+    $needle = "bool AutoUpdaterDialog::isSupported()`r`n{"
+    if (-not $text.Contains($needle)) { $needle = "bool AutoUpdaterDialog::isSupported()`n{" }
+    if (-not $text.Contains($needle)) { throw 'AutoUpdaterDialog.cpp isSupported anchor not found' }
+    $disable = @'
+	// PCSX2_MODERN_NETPLAY_DISABLE_STOCK_UPDATER
+	if (ModernNetplay::IsCustomBuild())
+		return false;
+
+'@
+    $text = $text.Replace($needle, $needle + "`r`n" + $disable)
 }
 if ($text -notmatch 'PCSX2_MODERN_NETPLAY_OFFICIAL_UPDATE_GUARD') {
     $needle = "void AutoUpdaterDialog::downloadUpdateClicked()`r`n{"

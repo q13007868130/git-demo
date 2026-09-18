@@ -177,9 +177,10 @@ void NetplayDialog::buildSetupUi()
     host_form->addRow(tr("房间人数："), m_host_players);
 
     m_host_delay = new QSpinBox(host_tab);
-    m_host_delay->setRange(1, 12);
+    m_host_delay->setRange(1, 100);
     m_host_delay->setValue(2);
     m_host_delay->setSuffix(tr(" 帧"));
+    m_host_delay->setToolTip(tr("1～100 帧。数值越高越能容忍高延迟网络，但操作延迟也会明显增加。"));
     host_form->addRow(tr("输入延迟："), m_host_delay);
 
     m_memcard_sync = new QCheckBox(tr("同步房主 1 号记忆卡（使用临时副本，不修改原记忆卡）"), host_tab);
