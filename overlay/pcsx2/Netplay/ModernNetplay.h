@@ -18,6 +18,7 @@ namespace ModernNetplay
         bool game_match = false;
         bool memcard_ready = false;
         bool boot_ready = false;
+        std::uint32_t controller = 0;
         std::string name;
     };
 
@@ -63,6 +64,9 @@ namespace ModernNetplay
         bool all_boot_ready = false;
         bool start_committed = false;
         bool first_poll_released = false;
+        std::uint32_t topology_mode = 1;
+        bool runtime_reconfiguring = false;
+        std::uint32_t input_epoch = 0;
     };
 
     // True for binaries produced by this Modern Netplay build pipeline.
@@ -83,6 +87,11 @@ namespace ModernNetplay
     // the shadow memory-card transfer has completed, then PREPARE_BOOT is sent.
     bool RequestSynchronizedBoot();
     bool ConsumeBootLaunchRequest(std::string* path);
+
+    // Live Netplay controls. Every peer may request its logical P1-P4 controller.
+    // Delay/topology are host-authoritative and can be changed during gameplay.
+    bool RequestRuntimeSettings(std::uint32_t local_controller,
+        std::uint32_t delay, std::uint32_t topology_mode);
 
     bool CanStartVM();
     bool ShouldHoldBootBarrier();

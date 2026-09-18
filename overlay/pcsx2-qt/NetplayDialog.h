@@ -6,6 +6,7 @@
 #include <QtWidgets/QDialog>
 
 class QCheckBox;
+class QComboBox;
 class QLabel;
 class QLineEdit;
 class QPushButton;
@@ -50,4 +51,8 @@ private:
     QLabel* m_session_status = nullptr;
     QTableWidget* m_players_table = nullptr;
     QPushButton* m_start_game = nullptr;
+    QComboBox* m_local_controller = nullptr;
+    QComboBox* m_topology_mode = nullptr;
+    QSpinBox* m_runtime_delay = nullptr;
+    QPushButton* m_apply_runtime = nullptr;
 };

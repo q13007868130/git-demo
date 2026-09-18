@@ -18,6 +18,7 @@
 #include <QtGui/QDesktopServices>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QCheckBox>
+#include <QtWidgets/QComboBox>
 #include <QtWidgets/QDialogButtonBox>
 #include <QtWidgets/QFormLayout>
 #include <QtWidgets/QGroupBox>
@@ -134,7 +135,9 @@ NetplayDialog::NetplayDialog(QWidget* parent)
 {
     m_lobby_mode = ModernNetplay::IsConfigured();
     setWindowTitle(m_lobby_mode ? tr("PCSX2 联机房间") : tr("PCSX2 联机"));
-    setModal(true);
+    setModal(false);
+    setWindowModality(Qt::NonModal);
+    setWindowFlag(Qt::WindowStaysOnTopHint, false);
 
     if (m_lobby_mode)
         buildLobbyUi();
@@ -236,8 +239,8 @@ void NetplayDialog::buildLobbyUi()
     root->addWidget(m_room_status);
 
     m_players_table = new QTableWidget(this);
-    m_players_table->setColumnCount(5);
-    m_players_table->setHorizontalHeaderLabels({tr("玩家"), tr("名称"), tr("游戏"), tr("记忆卡"), tr("启动")});
+    m_players_table->setColumnCount(6);
+    m_players_table->setHorizontalHeaderLabels({tr("连接"), tr("名称"), tr("手柄"), tr("游戏"), tr("记忆卡"), tr("启动")});
     m_players_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_players_table->setSelectionMode(QAbstractItemView::NoSelection);
     m_players_table->verticalHeader()->setVisible(false);
@@ -246,7 +249,38 @@ void NetplayDialog::buildLobbyUi()
     m_players_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     m_players_table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
     m_players_table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+    m_players_table->horizontalHeader()->setSectionResizeMode(5, QHeaderView::ResizeToContents);
     root->addWidget(m_players_table, 1);
+
+    const ModernNetplay::StatusSnapshot lobby_status = ModernNetplay::GetStatusSnapshot();
+    auto* runtime_group = new QGroupBox(tr("实时联机控制"), this);
+    auto* runtime_form = new QFormLayout(runtime_group);
+    m_local_controller = new QComboBox(runtime_group);
+    for (std::uint32_t i = 1; i <= lobby_status.max_players; i++)
+        m_local_controller->addItem(tr("P%1").arg(i), static_cast<int>(i));
+    runtime_form->addRow(tr("我控制："), m_local_controller);
+
+    m_runtime_delay = new QSpinBox(runtime_group);
+    m_runtime_delay->setRange(1, 100);
+    m_runtime_delay->setSuffix(tr(" 帧"));
+    m_runtime_delay->setValue(static_cast<int>(lobby_status.delay));
+    runtime_form->addRow(tr("输入延迟："), m_runtime_delay);
+
+    m_topology_mode = new QComboBox(runtime_group);
+    m_topology_mode->addItem(tr("兼容模式 A：Multitap 接 1 号端口（暴走单车等）"), 0);
+    m_topology_mode->addItem(tr("兼容模式 B：Multitap 接 2 号端口（按 Start 加入类）"), 1);
+    m_topology_mode->setCurrentIndex(lobby_status.topology_mode == 0 ? 0 : 1);
+    runtime_form->addRow(tr("多人手柄布局："), m_topology_mode);
+
+    m_apply_runtime = new QPushButton(tr("应用实时设置"), runtime_group);
+    runtime_form->addRow(QString(), m_apply_runtime);
+    auto* runtime_note = new QLabel(
+        tr("每个玩家都可以在游戏开始后或游戏途中切换自己控制的 P1～P4。"
+           "延迟和多人手柄布局由房主统一调整；运行中应用时会让所有机器短暂停顿，"
+           "同步重载手柄并重新建立输入同步点，不需要重启游戏或联机。"), runtime_group);
+    runtime_note->setWordWrap(true);
+    runtime_form->addRow(QString(), runtime_note);
+    root->addWidget(runtime_group);
 
     auto* state_group = new QGroupBox(tr("同步状态"), this);
     auto* state_form = new QFormLayout(state_group);
@@ -291,6 +325,21 @@ void NetplayDialog::buildLobbyUi()
         refreshLobby();
     });
     connect(m_start_game, &QPushButton::clicked, this, [this]() { chooseGameAndStart(); });
+    connect(m_apply_runtime, &QPushButton::clicked, this, [this]() {
+        const ModernNetplay::StatusSnapshot current = ModernNetplay::GetStatusSnapshot();
+        if (current.runtime_reconfiguring)
+        {
+            QMessageBox::information(this, tr("实时联机设置"), tr("上一项实时设置正在同步，请稍候。"));
+            return;
+        }
+        const std::uint32_t controller = static_cast<std::uint32_t>(m_local_controller->currentData().toUInt());
+        const std::uint32_t delay = (current.role == "host") ?
+            static_cast<std::uint32_t>(m_runtime_delay->value()) : current.delay;
+        const std::uint32_t topology = (current.role == "host") ?
+            static_cast<std::uint32_t>(m_topology_mode->currentData().toUInt()) : current.topology_mode;
+        if (!ModernNetplay::RequestRuntimeSettings(controller, delay, topology))
+            QMessageBox::warning(this, tr("实时联机设置"), tr("无法应用设置。可能正在进行另一项同步调整，请稍后再试。"));
+    });
     connect(leave_button, &QPushButton::clicked, this, [this]() { launchNormalInstance(); });
 
     const ModernNetplay::StatusSnapshot initial_status = ModernNetplay::GetStatusSnapshot();
@@ -423,11 +472,12 @@ void NetplayDialog::refreshLobby()
     for (std::uint32_t i = 0; i < status.max_players; i++)
     {
         const ModernNetplay::PlayerSnapshot& player = status.players[i];
-        m_players_table->setItem(static_cast<int>(i), 0, new QTableWidgetItem(tr("P%1").arg(i + 1)));
+        m_players_table->setItem(static_cast<int>(i), 0, new QTableWidgetItem(tr("连接%1").arg(i + 1)));
         m_players_table->setItem(static_cast<int>(i), 1, new QTableWidgetItem(player.connected ? QString::fromStdString(player.name) : tr("等待加入")));
-        m_players_table->setItem(static_cast<int>(i), 2, new QTableWidgetItem(player.connected ? (player.game_match ? tr("匹配 ✓") : tr("等待")) : QStringLiteral("-")));
-        m_players_table->setItem(static_cast<int>(i), 3, new QTableWidgetItem(player.connected ? (player.memcard_ready ? tr("完成 ✓") : tr("等待")) : QStringLiteral("-")));
-        m_players_table->setItem(static_cast<int>(i), 4, new QTableWidgetItem(player.connected ? (player.boot_ready ? tr("就绪 ✓") : tr("等待")) : QStringLiteral("-")));
+        m_players_table->setItem(static_cast<int>(i), 2, new QTableWidgetItem(player.connected && player.controller > 0 ? tr("P%1").arg(player.controller) : QStringLiteral("-")));
+        m_players_table->setItem(static_cast<int>(i), 3, new QTableWidgetItem(player.connected ? (player.game_match ? tr("匹配 ✓") : tr("等待")) : QStringLiteral("-")));
+        m_players_table->setItem(static_cast<int>(i), 4, new QTableWidgetItem(player.connected ? (player.memcard_ready ? tr("完成 ✓") : tr("等待")) : QStringLiteral("-")));
+        m_players_table->setItem(static_cast<int>(i), 5, new QTableWidgetItem(player.connected ? (player.boot_ready ? tr("就绪 ✓") : tr("等待")) : QStringLiteral("-")));
     }
 
     if (!status.game_selected)
@@ -464,10 +514,31 @@ void NetplayDialog::refreshLobby()
     else
         m_boot_status->setText(tr("同步启动完成 ✓"));
 
-    m_session_status->setText(tr("P%1 · 会话 %2 · TCP %3")
+    const std::uint32_t local_controller =
+        (status.local_player_id >= 1 && status.local_player_id <= ModernNetplay::MAX_PLAYERS) ?
+        status.players[status.local_player_id - 1].controller : status.local_player_id;
+    m_session_status->setText(tr("连接%1 → P%2 · 会话 %3 · TCP %4 · Epoch %5%6")
         .arg(status.local_player_id)
+        .arg(local_controller)
         .arg(QStringLiteral("%1").arg(status.session_id, 16, 16, QLatin1Char('0')).toUpper())
-        .arg(status.port));
+        .arg(status.port)
+        .arg(status.input_epoch)
+        .arg(status.runtime_reconfiguring ? tr(" · 正在同步实时设置…") : QString()));
+
+    if (m_local_controller && !m_local_controller->hasFocus())
+    {
+        const int index = m_local_controller->findData(static_cast<int>(local_controller));
+        if (index >= 0)
+            m_local_controller->setCurrentIndex(index);
+    }
+    if (m_runtime_delay && !m_runtime_delay->hasFocus())
+        m_runtime_delay->setValue(static_cast<int>(status.delay));
+    if (m_topology_mode && !m_topology_mode->hasFocus())
+        m_topology_mode->setCurrentIndex(status.topology_mode == 0 ? 0 : 1);
+    m_runtime_delay->setEnabled(is_host && !status.runtime_reconfiguring);
+    m_topology_mode->setEnabled(is_host && !status.runtime_reconfiguring);
+    m_local_controller->setEnabled(!status.runtime_reconfiguring);
+    m_apply_runtime->setEnabled(!status.runtime_reconfiguring);
 
     m_start_game->setVisible(is_host);
     m_start_game->setEnabled(is_host && status.room_full && !status.start_requested && !QtHost::IsVMValid());

@@ -129,9 +129,10 @@ if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
 	QMenu* netplay_menu = new QMenu(tr("联机(&N)"), menuBar());
 	menuBar()->insertMenu(m_ui.menuHelp->menuAction(), netplay_menu);
 	QAction* netplay_open = netplay_menu->addAction(tr("联机大厅..."));
-	connect(netplay_open, &QAction::triggered, this, [this]() {
-		NetplayDialog dialog(this);
-		dialog.exec();
+	connect(netplay_open, &QAction::triggered, this, []() {
+		auto* dialog = new NetplayDialog(nullptr);
+		dialog->setAttribute(Qt::WA_DeleteOnClose, true);
+		dialog->show();
 	});
 
 	netplay_menu->addSeparator();
@@ -160,9 +161,10 @@ if ($text -notmatch 'PCSX2_MODERN_NETPLAY_MENU') {
 
 	if (qEnvironmentVariableIsSet("PCSX2_NETPLAY_SHOW_LOBBY"))
 	{
-		QTimer::singleShot(250, this, [this]() {
-			NetplayDialog dialog(this);
-			dialog.exec();
+		QTimer::singleShot(250, this, []() {
+			auto* dialog = new NetplayDialog(nullptr);
+			dialog->setAttribute(Qt::WA_DeleteOnClose, true);
+			dialog->show();
 		});
 	}
 '@

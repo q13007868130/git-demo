@@ -12,6 +12,7 @@
 #include "common/Path.h"
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Memcard/MemoryCardFolder.h"
+#include "SIO/Pad/Pad.h"
 
 #include <algorithm>
 #include <array>
@@ -51,7 +52,7 @@ namespace
     constexpr std::uint32_t INPUT_MAGIC = 0x494E5054;   // INPT
     constexpr std::uint32_t BUNDLE_MAGIC = 0x424E444C;  // BNDL
     constexpr std::uint32_t CONTROL_MAGIC = 0x43544C31; // CTL1
-    constexpr std::uint32_t PROTOCOL_VERSION = 5;
+    constexpr std::uint32_t PROTOCOL_VERSION = 6;
     constexpr std::uint16_t DEFAULT_PORT = 27886;
     constexpr int RECEIVE_TIMEOUT_SECONDS = 30;
     constexpr int BOOT_BARRIER_TIMEOUT_SECONDS = 90;
@@ -59,10 +60,11 @@ namespace
     constexpr std::uint32_t MAX_CONTROL_PAYLOAD = 64 * 1024;
     constexpr std::uint32_t MEMCARD_CHUNK = 60 * 1024;
     constexpr std::size_t HELLO_SIZE = 80;
-    constexpr std::size_t INPUT_PACKET_SIZE = 12 + INPUT_FRAME_BYTES;
-    constexpr std::size_t INPUT_REST_SIZE = 8 + INPUT_FRAME_BYTES;
-    constexpr std::size_t BUNDLE_PACKET_SIZE = 12 + (MAX_PLAYERS * INPUT_FRAME_BYTES);
-    constexpr std::size_t BUNDLE_REST_SIZE = 8 + (MAX_PLAYERS * INPUT_FRAME_BYTES);
+    constexpr std::size_t INPUT_PACKET_SIZE = 16 + INPUT_FRAME_BYTES;
+    constexpr std::size_t INPUT_REST_SIZE = 12 + INPUT_FRAME_BYTES;
+    constexpr std::size_t BUNDLE_PACKET_SIZE = 16 + (MAX_PLAYERS * INPUT_FRAME_BYTES);
+    constexpr std::size_t BUNDLE_REST_SIZE = 12 + (MAX_PLAYERS * INPUT_FRAME_BYTES);
+    constexpr std::size_t RUNTIME_CONFIG_SIZE = 28;
     constexpr InputFrame NEUTRAL_FRAME = {
         0xff, 0xff,                   // digital buttons
         0x7f, 0x7f, 0x7f, 0x7f,     // right/left analog axes
@@ -93,6 +95,10 @@ namespace
         FirstPollReady = 11,
         FirstPollGo = 12,
         SessionAbort = 13,
+        RuntimeRequest = 14,
+        RuntimeApply = 15,
+        RuntimeAck = 16,
+        RuntimeCommit = 17,
     };
 
     struct PlayerState
@@ -102,6 +108,7 @@ namespace
         bool memcard_ready = false;
         bool boot_ready = false;
         bool first_poll_ready = false;
+        std::uint32_t controller = 0;
         std::string name;
     };
 
@@ -250,6 +257,8 @@ namespace
                 return;
 
             m_session_id = static_cast<std::uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+            for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                m_players[i].controller = i + 1;
             m_players[0].connected = (m_role == Role::Host);
             m_players[0].name = (m_role == Role::Host) ? m_username : std::string("房主");
             if (m_role == Role::Host)
@@ -328,6 +337,7 @@ namespace
                 out.players[i].game_match = m_players[i].game_match;
                 out.players[i].memcard_ready = m_players[i].memcard_ready;
                 out.players[i].boot_ready = m_players[i].boot_ready;
+                out.players[i].controller = m_players[i].controller;
                 out.players[i].name = m_players[i].name;
             }
 
@@ -353,6 +363,9 @@ namespace
             out.all_boot_ready = AllBootReadyLocked();
             out.start_committed = m_start_committed;
             out.first_poll_released = m_first_poll_go;
+            out.topology_mode = m_topology_mode.load(std::memory_order_acquire);
+            out.runtime_reconfiguring = m_runtime_reconfiguring;
+            out.input_epoch = m_input_epoch.load(std::memory_order_acquire);
             return out;
         }
 
@@ -477,17 +490,21 @@ namespace
         {
             if (!IsConfigured())
                 return false;
-
-            // Stable topology across 1-4 players:
-            // P1=0, P2=1, P3=5, P4=6.
-            if (slot == 0)
-                return m_max_players >= 1;
-            if (slot == 1)
-                return m_max_players >= 2;
-            if (slot == 5)
-                return m_max_players >= 3;
-            if (slot == 6)
-                return m_max_players >= 4;
+            const std::uint32_t topology = m_topology_mode.load(std::memory_order_acquire);
+            if (topology == 0)
+            {
+                if (slot == 0) return m_max_players >= 1;
+                if (slot == 2) return m_max_players >= 2;
+                if (slot == 3) return m_max_players >= 3;
+                if (slot == 4) return m_max_players >= 4;
+            }
+            else
+            {
+                if (slot == 0) return m_max_players >= 1;
+                if (slot == 1) return m_max_players >= 2;
+                if (slot == 5) return m_max_players >= 3;
+                if (slot == 6) return m_max_players >= 4;
+            }
             return false;
         }
 
@@ -501,16 +518,19 @@ namespace
             if (!IsConfigured())
                 return;
 
-            // Preserve P2 on the normal second controller port and expand
-            // P3/P4 from the Multitap attached to controller port 2.
-            // This matches the legacy PCSX2 Online pad layout and fixes games
-            // which require P2/P3/P4 to press START to join.
-            EmuConfig.Pad.MultitapPort0_Enabled = false;
-            EmuConfig.Pad.MultitapPort1_Enabled = (m_max_players >= 3);
+            const std::uint32_t topology = m_topology_mode.load(std::memory_order_acquire);
+            EmuConfig.Pad.MultitapPort0_Enabled = (m_max_players >= 3 && topology == 0);
+            EmuConfig.Pad.MultitapPort1_Enabled = (m_max_players >= 3 && topology == 1);
 
             if (m_max_players >= 3)
-                Log("pad topology: P1=slot0 P2=slot1 P3=slot5%s; multitap=controller-port-2",
-                    (m_max_players >= 4) ? " P4=slot6" : "");
+            {
+                if (topology == 0)
+                    Log("pad topology: P1=slot0 P2=slot2 P3=slot3%s; multitap=controller-port-1",
+                        (m_max_players >= 4) ? " P4=slot4" : "");
+                else
+                    Log("pad topology: P1=slot0 P2=slot1 P3=slot5%s; multitap=controller-port-2",
+                        (m_max_players >= 4) ? " P4=slot6" : "");
+            }
 
             std::string shadow_name;
             bool memcard_ready = false;
@@ -845,23 +865,21 @@ namespace
 
         int SlotToPlayerIndex(std::uint32_t slot) const
         {
-            // Keep the proven 1P/2P topology unchanged:
-            //   P1 = controller port 1 slot A -> unified 0
-            //   P2 = controller port 2 slot A -> unified 1
-            //
-            // For 3P/4P, attach the Multitap to controller port 2 so P2
-            // remains on the same logical pad that 2-player games expect.
-            // PCSX2 then exposes additional port-2 Multitap pads as 5, 6, 7:
-            //   P3 = unified 5
-            //   P4 = unified 6
-            if (slot == 0)
-                return 0;
-            if (m_max_players >= 2 && slot == 1)
-                return 1;
-            if (m_max_players >= 3 && slot == 5)
-                return 2;
-            if (m_max_players >= 4 && slot == 6)
-                return 3;
+            const std::uint32_t topology = m_topology_mode.load(std::memory_order_acquire);
+            if (topology == 0)
+            {
+                if (slot == 0) return 0;
+                if (m_max_players >= 2 && slot == 2) return 1;
+                if (m_max_players >= 3 && slot == 3) return 2;
+                if (m_max_players >= 4 && slot == 4) return 3;
+            }
+            else
+            {
+                if (slot == 0) return 0;
+                if (m_max_players >= 2 && slot == 1) return 1;
+                if (m_max_players >= 3 && slot == 5) return 2;
+                if (m_max_players >= 4 && slot == 6) return 3;
+            }
             return -1;
         }
 
@@ -962,6 +980,8 @@ namespace
                 m_memory_card_sync_enabled = (ReadU32(incoming.data() + 32) != 0);
                 m_players[0].connected = true;
                 m_players[0].name = host_name.empty() ? "房主" : host_name;
+                for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                    m_players[i].controller = i + 1;
                 m_players[assigned - 1].connected = true;
                 m_players[assigned - 1].name = m_username;
                 m_last_error.clear();
@@ -1051,6 +1071,7 @@ namespace
                 {
                     std::lock_guard<std::mutex> lock(m_state_mutex);
                     m_players[player_id - 1] = PlayerState{};
+                    m_players[player_id - 1].controller = player_id;
                     m_players[player_id - 1].connected = true;
                     m_players[player_id - 1].name = player_name;
                 }
@@ -1206,13 +1227,13 @@ namespace
         {
             if (m_role != Role::Host)
                 return;
-            std::array<std::uint8_t, 4 + MAX_PLAYERS * 44> payload{};
+            std::array<std::uint8_t, 4 + MAX_PLAYERS * 48> payload{};
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 WriteU32(payload.data(), m_max_players);
                 for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
                 {
-                    std::uint8_t* row = payload.data() + 4 + i * 44;
+                    std::uint8_t* row = payload.data() + 4 + i * 48;
                     WriteU32(row + 0, i + 1);
                     std::uint32_t flags = 0;
                     flags |= m_players[i].connected ? 1u : 0u;
@@ -1220,7 +1241,8 @@ namespace
                     flags |= m_players[i].memcard_ready ? 4u : 0u;
                     flags |= m_players[i].boot_ready ? 8u : 0u;
                     WriteU32(row + 4, flags);
-                    std::snprintf(reinterpret_cast<char*>(row + 8), 36, "%s", m_players[i].name.c_str());
+                    WriteU32(row + 8, m_players[i].controller);
+                    std::snprintf(reinterpret_cast<char*>(row + 12), 36, "%s", m_players[i].name.c_str());
                 }
             }
             BroadcastControl(ControlType::Roster, payload.data(), static_cast<std::uint32_t>(payload.size()));
@@ -1259,7 +1281,7 @@ namespace
 
         void HandleRoster(const std::vector<std::uint8_t>& payload)
         {
-            if (payload.size() != (4 + MAX_PLAYERS * 44))
+            if (payload.size() != (4 + MAX_PLAYERS * 48))
                 return;
             const std::uint32_t max_players = ReadU32(payload.data());
             if (max_players < 1 || max_players > MAX_PLAYERS)
@@ -1268,7 +1290,7 @@ namespace
             m_max_players = max_players;
             for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
             {
-                const std::uint8_t* row = payload.data() + 4 + i * 44;
+                const std::uint8_t* row = payload.data() + 4 + i * 48;
                 const std::uint32_t id = ReadU32(row);
                 if (id != i + 1)
                     continue;
@@ -1277,7 +1299,8 @@ namespace
                 m_players[i].game_match = (flags & 2u) != 0;
                 m_players[i].memcard_ready = (flags & 4u) != 0;
                 m_players[i].boot_ready = (flags & 8u) != 0;
-                const char* name = reinterpret_cast<const char*>(row + 8);
+                m_players[i].controller = ReadU32(row + 8);
+                const char* name = reinterpret_cast<const char*>(row + 12);
                 std::size_t len = 0;
                 while (len < 36 && name[len] != '\0')
                     ++len;
@@ -1789,8 +1812,14 @@ namespace
             if (!changed)
                 return;
 
+            std::uint32_t local_controller = m_local_player_id;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (m_local_player_id >= 1 && m_local_player_id <= MAX_PLAYERS)
+                    local_controller = m_players[m_local_player_id - 1].controller;
+            }
             Log("INPUT P%u poll=%u digital=%02X %02X pressure[dpad R,L,U,D=%u,%u,%u,%u face T,O,X,S=%u,%u,%u,%u shoulders=%u,%u,%u,%u]",
-                static_cast<unsigned>(m_local_player_id), static_cast<unsigned>(frame),
+                static_cast<unsigned>(local_controller), static_cast<unsigned>(frame),
                 static_cast<unsigned>(input[0]), static_cast<unsigned>(input[1]),
                 static_cast<unsigned>(input[6]), static_cast<unsigned>(input[7]),
                 static_cast<unsigned>(input[8]), static_cast<unsigned>(input[9]),
@@ -1799,6 +1828,278 @@ namespace
                 static_cast<unsigned>(input[14]), static_cast<unsigned>(input[15]),
                 static_cast<unsigned>(input[16]), static_cast<unsigned>(input[17]));
             m_last_logged_local_input = input;
+        }
+
+        bool ValidateControllerMap(const std::array<std::uint32_t, MAX_PLAYERS>& controllers) const
+        {
+            std::array<bool, MAX_PLAYERS> seen{};
+            for (std::uint32_t i = 0; i < m_max_players; i++)
+            {
+                const std::uint32_t value = controllers[i];
+                if (value < 1 || value > m_max_players || seen[value - 1])
+                    return false;
+                seen[value - 1] = true;
+            }
+            return true;
+        }
+
+        std::array<std::uint32_t, MAX_PLAYERS> CurrentControllerMap() const
+        {
+            std::array<std::uint32_t, MAX_PLAYERS> out{1, 2, 3, 4};
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                out[i] = m_players[i].controller ? m_players[i].controller : (i + 1);
+            return out;
+        }
+
+        std::array<std::uint8_t, RUNTIME_CONFIG_SIZE> BuildRuntimeConfig(
+            std::uint32_t change_id, std::uint32_t delay, std::uint32_t topology,
+            const std::array<std::uint32_t, MAX_PLAYERS>& controllers) const
+        {
+            std::array<std::uint8_t, RUNTIME_CONFIG_SIZE> payload{};
+            WriteU32(payload.data() + 0, change_id);
+            WriteU32(payload.data() + 4, delay);
+            WriteU32(payload.data() + 8, topology);
+            for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                WriteU32(payload.data() + 12 + i * 4, controllers[i]);
+            return payload;
+        }
+
+        bool ParseRuntimeConfig(const std::vector<std::uint8_t>& payload,
+            std::uint32_t* change_id, std::uint32_t* delay, std::uint32_t* topology,
+            std::array<std::uint32_t, MAX_PLAYERS>* controllers) const
+        {
+            if (payload.size() != RUNTIME_CONFIG_SIZE)
+                return false;
+            *change_id = ReadU32(payload.data() + 0);
+            *delay = ReadU32(payload.data() + 4);
+            *topology = ReadU32(payload.data() + 8);
+            for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                (*controllers)[i] = ReadU32(payload.data() + 12 + i * 4);
+            return *change_id != 0 && *delay >= 1 && *delay <= 100 &&
+                *topology <= 1 && ValidateControllerMap(*controllers);
+        }
+
+        void PauseForRuntimeReconfigure()
+        {
+            if (!VMManager::HasValidVM())
+                return;
+            Host::RunOnCPUThread([this]() {
+                if (!VMManager::HasValidVM())
+                    return;
+                const VMState state = VMManager::GetState();
+                {
+                    std::lock_guard<std::mutex> lock(m_state_mutex);
+                    m_resume_after_reconfig = (state == VMState::Running);
+                }
+                if (state == VMState::Running)
+                    VMManager::SetState(VMState::Paused);
+            }, true);
+        }
+
+        void ReloadRuntimePads()
+        {
+            if (!VMManager::HasValidVM())
+                return;
+            Host::RunOnCPUThread([this]() {
+                if (!VMManager::HasValidVM())
+                    return;
+                const std::uint32_t topology = m_topology_mode.load(std::memory_order_acquire);
+                EmuConfig.Pad.MultitapPort0_Enabled = (m_max_players >= 3 && topology == 0);
+                EmuConfig.Pad.MultitapPort1_Enabled = (m_max_players >= 3 && topology == 1);
+                auto lock = Host::GetSettingsLock();
+                Pad::LoadConfig(*Host::GetSettingsInterface());
+            }, true);
+        }
+
+        void ResetRuntimeInputEpoch(std::uint32_t change_id)
+        {
+            m_input_epoch.store(change_id, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(m_input_mutex);
+                for (auto& map : m_player_inputs)
+                    map.clear();
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_bundle_mutex);
+                m_bundles.clear();
+            }
+            m_frame = 0;
+            m_have_capture = false;
+            m_capture = NEUTRAL_FRAME;
+            m_last_logged_local_input = NEUTRAL_FRAME;
+            m_output_bundle.fill(NEUTRAL_FRAME);
+            m_input_cv.notify_all();
+            m_bundle_cv.notify_all();
+        }
+
+        bool ApplyRuntimeConfigLocal(std::uint32_t change_id, std::uint32_t delay,
+            std::uint32_t topology, const std::array<std::uint32_t, MAX_PLAYERS>& controllers)
+        {
+            if (delay < 1 || delay > 100 || topology > 1 || !ValidateControllerMap(controllers))
+                return false;
+            PauseForRuntimeReconfigure();
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                m_runtime_reconfiguring = true;
+                m_runtime_change_id = change_id;
+                for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
+                    m_players[i].controller = controllers[i];
+                m_first_poll_go = false;
+                for (auto& player : m_players)
+                    player.first_poll_ready = false;
+            }
+            m_delay.store(delay, std::memory_order_release);
+            m_topology_mode.store(topology, std::memory_order_release);
+            ResetRuntimeInputEpoch(change_id);
+            ReloadRuntimePads();
+            Log("runtime config locally applied: change=%u delay=%u topology=%u controllers=%u,%u,%u,%u",
+                static_cast<unsigned>(change_id), static_cast<unsigned>(delay), static_cast<unsigned>(topology),
+                static_cast<unsigned>(controllers[0]), static_cast<unsigned>(controllers[1]),
+                static_cast<unsigned>(controllers[2]), static_cast<unsigned>(controllers[3]));
+            return true;
+        }
+
+        void FinishRuntimeConfig(std::uint32_t change_id)
+        {
+            bool resume = false;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (!m_runtime_reconfiguring || m_runtime_change_id != change_id)
+                    return;
+                m_runtime_reconfiguring = false;
+                resume = m_resume_after_reconfig;
+                m_resume_after_reconfig = false;
+            }
+            if (resume && VMManager::HasValidVM())
+            {
+                Host::RunOnCPUThread([]() {
+                    if (VMManager::HasValidVM() && VMManager::GetState() == VMState::Paused)
+                        VMManager::SetState(VMState::Running);
+                });
+            }
+            Host::AddKeyedOSDMessage("ModernNetplayRuntimeConfig",
+                "联机实时设置已同步应用。", 5.0f);
+            Log("runtime config committed: change=%u", static_cast<unsigned>(change_id));
+        }
+
+        void MaybeCommitRuntimeConfig()
+        {
+            if (m_role != Role::Host)
+                return;
+            std::uint32_t change_id = 0;
+            bool ready = false;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (!m_runtime_reconfiguring)
+                    return;
+                ready = true;
+                for (std::uint32_t i = 0; i < m_max_players; i++)
+                {
+                    if (m_players[i].connected && !m_runtime_acks[i])
+                    {
+                        ready = false;
+                        break;
+                    }
+                }
+                change_id = m_runtime_change_id;
+            }
+            if (!ready)
+                return;
+            std::array<std::uint8_t, 4> payload{};
+            WriteU32(payload.data(), change_id);
+            BroadcastControl(ControlType::RuntimeCommit, payload.data(), static_cast<std::uint32_t>(payload.size()));
+            FinishRuntimeConfig(change_id);
+            BroadcastRoster();
+        }
+
+        bool BeginHostRuntimeConfig(std::uint32_t delay, std::uint32_t topology,
+            const std::array<std::uint32_t, MAX_PLAYERS>& controllers)
+        {
+            if (m_role != Role::Host || delay < 1 || delay > 100 || topology > 1 ||
+                !ValidateControllerMap(controllers))
+                return false;
+            std::uint32_t change_id = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (m_runtime_reconfiguring)
+                    return false;
+                change_id = ++m_runtime_change_counter;
+                if (change_id == 0)
+                    change_id = ++m_runtime_change_counter;
+                m_runtime_reconfiguring = true;
+                m_runtime_change_id = change_id;
+                m_runtime_acks.fill(false);
+                m_runtime_acks[0] = true;
+            }
+            const auto payload = BuildRuntimeConfig(change_id, delay, topology, controllers);
+            BroadcastControl(ControlType::RuntimeApply, payload.data(), static_cast<std::uint32_t>(payload.size()));
+            if (!ApplyRuntimeConfigLocal(change_id, delay, topology, controllers))
+            {
+                Fail("failed to apply host runtime Netplay configuration");
+                return false;
+            }
+            BroadcastRoster();
+            MaybeCommitRuntimeConfig();
+            return true;
+        }
+
+        bool RequestRuntimeSettings(std::uint32_t local_controller,
+            std::uint32_t delay, std::uint32_t topology)
+        {
+            if (local_controller < 1 || local_controller > m_max_players)
+                return false;
+            if (m_role == Role::Client)
+            {
+                std::array<std::uint8_t, 4> payload{};
+                WriteU32(payload.data(), local_controller);
+                return SendControlToHost(ControlType::RuntimeRequest,
+                    payload.data(), static_cast<std::uint32_t>(payload.size()));
+            }
+            if (m_role != Role::Host)
+                return false;
+
+            delay = std::clamp<std::uint32_t>(delay, 1, 100);
+            topology = std::min<std::uint32_t>(topology, 1);
+            auto controllers = CurrentControllerMap();
+            const std::uint32_t current = controllers[0];
+            if (current != local_controller)
+            {
+                for (std::uint32_t i = 0; i < m_max_players; i++)
+                {
+                    if (controllers[i] == local_controller)
+                    {
+                        controllers[i] = current;
+                        break;
+                    }
+                }
+                controllers[0] = local_controller;
+            }
+            return BeginHostRuntimeConfig(delay, topology, controllers);
+        }
+
+        void HandleRuntimeRequest(std::uint32_t requester_id, std::uint32_t desired_controller)
+        {
+            if (m_role != Role::Host || requester_id < 1 || requester_id > m_max_players ||
+                desired_controller < 1 || desired_controller > m_max_players)
+                return;
+            auto controllers = CurrentControllerMap();
+            const std::uint32_t requester = requester_id - 1;
+            const std::uint32_t current = controllers[requester];
+            if (current != desired_controller)
+            {
+                for (std::uint32_t i = 0; i < m_max_players; i++)
+                {
+                    if (controllers[i] == desired_controller)
+                    {
+                        controllers[i] = current;
+                        break;
+                    }
+                }
+                controllers[requester] = desired_controller;
+            }
+            BeginHostRuntimeConfig(m_delay.load(std::memory_order_acquire),
+                m_topology_mode.load(std::memory_order_acquire), controllers);
         }
 
         void BroadcastSessionAbort(const std::string& reason)
@@ -1839,7 +2140,8 @@ namespace
             WriteU32(packet.data(), INPUT_MAGIC);
             WriteU32(packet.data() + 4, frame);
             WriteU32(packet.data() + 8, m_local_player_id);
-            std::memcpy(packet.data() + 12, input.data(), input.size());
+            WriteU32(packet.data() + 12, m_input_epoch.load(std::memory_order_acquire));
+            std::memcpy(packet.data() + 16, input.data(), input.size());
             std::lock_guard<std::mutex> socket_lock(m_client_socket_mutex);
             return m_client_socket != INVALID_SOCKET &&
                 SendPacketLocked(m_client_socket, m_client_send_mutex, packet.data(), packet.size());
@@ -1851,8 +2153,9 @@ namespace
             WriteU32(packet.data(), BUNDLE_MAGIC);
             WriteU32(packet.data() + 4, frame);
             WriteU32(packet.data() + 8, m_max_players);
+            WriteU32(packet.data() + 12, m_input_epoch.load(std::memory_order_acquire));
             for (std::size_t i = 0; i < MAX_PLAYERS; i++)
-                std::memcpy(packet.data() + 12 + i * INPUT_FRAME_BYTES, bundle[i].data(), INPUT_FRAME_BYTES);
+                std::memcpy(packet.data() + 16 + i * INPUT_FRAME_BYTES, bundle[i].data(), INPUT_FRAME_BYTES);
 
             std::lock_guard<std::mutex> lock(m_peer_mutex);
             for (auto& peer : m_peers)
@@ -1933,9 +2236,14 @@ namespace
                 LogLocalInputTransition(m_frame, m_capture);
                 if (m_role == Role::Host)
                 {
+                    std::uint32_t controller = 1;
+                    {
+                        std::lock_guard<std::mutex> lock(m_state_mutex);
+                        controller = m_players[0].controller;
+                    }
                     {
                         std::lock_guard<std::mutex> lock(m_input_mutex);
-                        m_player_inputs[0][m_frame] = m_capture;
+                        m_player_inputs[controller - 1][m_frame] = m_capture;
                     }
                     m_input_cv.notify_all();
                 }
@@ -2028,16 +2336,26 @@ namespace
                         break;
                     const std::uint32_t frame = ReadU32(rest.data());
                     const std::uint32_t player_id = ReadU32(rest.data() + 4);
+                    const std::uint32_t epoch = ReadU32(rest.data() + 8);
                     if (player_id != peer->player_id)
                     {
                         Fail("controller input player id mismatch");
                         break;
                     }
+                    if (epoch != m_input_epoch.load(std::memory_order_acquire))
+                        continue;
+                    std::uint32_t controller = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(m_state_mutex);
+                        controller = m_players[player_id - 1].controller;
+                    }
+                    if (controller < 1 || controller > m_max_players)
+                        continue;
                     InputFrame input{};
-                    std::memcpy(input.data(), rest.data() + 8, input.size());
+                    std::memcpy(input.data(), rest.data() + 12, input.size());
                     {
                         std::lock_guard<std::mutex> lock(m_input_mutex);
-                        m_player_inputs[player_id - 1][frame] = input;
+                        m_player_inputs[controller - 1][frame] = input;
                     }
                     m_input_cv.notify_all();
                     continue;
@@ -2109,15 +2427,18 @@ namespace
                         break;
                     const std::uint32_t frame = ReadU32(rest.data());
                     const std::uint32_t count = ReadU32(rest.data() + 4);
+                    const std::uint32_t epoch = ReadU32(rest.data() + 8);
                     if (count < 1 || count > MAX_PLAYERS)
                     {
                         Fail("invalid authoritative input bundle");
                         break;
                     }
+                    if (epoch != m_input_epoch.load(std::memory_order_acquire))
+                        continue;
                     InputBundle bundle{};
                     bundle.fill(NEUTRAL_FRAME);
                     for (std::size_t i = 0; i < MAX_PLAYERS; i++)
-                        std::memcpy(bundle[i].data(), rest.data() + 8 + i * INPUT_FRAME_BYTES, INPUT_FRAME_BYTES);
+                        std::memcpy(bundle[i].data(), rest.data() + 12 + i * INPUT_FRAME_BYTES, INPUT_FRAME_BYTES);
                     {
                         std::lock_guard<std::mutex> lock(m_bundle_mutex);
                         m_bundles[frame] = bundle;
@@ -2246,6 +2567,25 @@ namespace
                     Fail(reason.c_str());
                     break;
                 }
+                case ControlType::RuntimeRequest:
+                {
+                    if (payload.size() == 4)
+                        HandleRuntimeRequest(peer.player_id, ReadU32(payload.data()));
+                    break;
+                }
+                case ControlType::RuntimeAck:
+                {
+                    if (payload.size() != 4)
+                        break;
+                    const std::uint32_t change_id = ReadU32(payload.data());
+                    {
+                        std::lock_guard<std::mutex> lock(m_state_mutex);
+                        if (m_runtime_reconfiguring && change_id == m_runtime_change_id)
+                            m_runtime_acks[peer.player_id - 1] = true;
+                    }
+                    MaybeCommitRuntimeConfig();
+                    break;
+                }
                 default:
                     break;
             }
@@ -2301,6 +2641,30 @@ namespace
                     Fail(reason.c_str());
                     break;
                 }
+                case ControlType::RuntimeApply:
+                {
+                    std::uint32_t change_id = 0;
+                    std::uint32_t delay = 0;
+                    std::uint32_t topology = 0;
+                    std::array<std::uint32_t, MAX_PLAYERS> controllers{};
+                    if (!ParseRuntimeConfig(payload, &change_id, &delay, &topology, &controllers) ||
+                        !ApplyRuntimeConfigLocal(change_id, delay, topology, controllers))
+                    {
+                        Fail("invalid runtime Netplay configuration");
+                        break;
+                    }
+                    std::array<std::uint8_t, 4> ack{};
+                    WriteU32(ack.data(), change_id);
+                    if (!SendControlToHost(ControlType::RuntimeAck, ack.data(), static_cast<std::uint32_t>(ack.size())))
+                        Fail("failed to acknowledge runtime Netplay configuration");
+                    break;
+                }
+                case ControlType::RuntimeCommit:
+                {
+                    if (payload.size() == 4)
+                        FinishRuntimeConfig(ReadU32(payload.data()));
+                    break;
+                }
                 default:
                     break;
             }
@@ -2332,9 +2696,16 @@ namespace
         std::uint32_t m_local_player_id = 0;
         std::uint64_t m_session_id = 0;
         std::atomic<std::uint32_t> m_delay{2};
+        std::atomic<std::uint32_t> m_topology_mode{1};
+        std::atomic<std::uint32_t> m_input_epoch{0};
         bool m_memory_card_sync_enabled = true;
 
         std::array<PlayerState, MAX_PLAYERS> m_players{};
+        bool m_runtime_reconfiguring = false;
+        bool m_resume_after_reconfig = false;
+        std::uint32_t m_runtime_change_counter = 0;
+        std::uint32_t m_runtime_change_id = 0;
+        std::array<bool, MAX_PLAYERS> m_runtime_acks{};
         bool m_game_selected = false;
         bool m_local_game_match = false;
         std::string m_game_title;
@@ -2443,6 +2814,10 @@ bool HostSelectGame(const std::string& path, const std::string& title, const std
 }
 bool RequestSynchronizedBoot() { return GetSession().RequestSynchronizedBoot(); }
 bool ConsumeBootLaunchRequest(std::string* path) { return GetSession().ConsumeBootLaunchRequest(path); }
+bool RequestRuntimeSettings(std::uint32_t local_controller, std::uint32_t delay, std::uint32_t topology_mode)
+{
+    return GetSession().RequestRuntimeSettings(local_controller, delay, topology_mode);
+}
 bool CanStartVM() { return GetSession().CanStartVM(); }
 bool ShouldHoldBootBarrier() { return GetSession().ShouldHoldBootBarrier(); }
 void NotifyBootReady() { GetSession().NotifyBootReady(); }
@@ -2464,6 +2839,7 @@ StatusSnapshot GetStatusSnapshot() { return {}; }
 bool HostSelectGame(const std::string&, const std::string&, const std::string&, std::uint32_t) { return false; }
 bool RequestSynchronizedBoot() { return false; }
 bool ConsumeBootLaunchRequest(std::string*) { return false; }
+bool RequestRuntimeSettings(std::uint32_t, std::uint32_t, std::uint32_t) { return false; }
 bool CanStartVM() { return true; }
 bool ShouldHoldBootBarrier() { return false; }
 void NotifyBootReady() {}

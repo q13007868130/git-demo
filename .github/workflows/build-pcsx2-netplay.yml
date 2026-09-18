@@ -108,14 +108,20 @@ jobs:
           $channel = if ($env:GITHUB_REF -eq "refs/heads/master") { "stable" } else { "test" }
           $channel | Set-Content -Encoding ASCII src\bin\NETPLAY_UPDATE_CHANNEL.txt
           @"
-          PCSX2 Modern Netplay v0.5b-r7 3-4P START-join topology fix
+          PCSX2 Modern Netplay v0.5b-r8 live player/delay/topology controls
           =================================================
           Base: current PCSX2 master at build time (exact SHA in PCSX2_UPSTREAM_SHA.txt)
-          Protocol: v5 host-authoritative multiplayer + full 18-byte DualShock2 input + synchronized boot
+          Protocol: v6 host-authoritative multiplayer + runtime controller/delay/topology reconfiguration
           Transport: reliable TCP
           Default port: 27886/TCP
 
           Included in this single test build:
+          - v0.5b-r8: every connected player can switch which logical P1-P4 controller they own before boot or during gameplay; occupied positions are swapped by the host.
+          - v0.5b-r8: host can change input delay from 1-100 frames while the game is running; no process/game restart is required.
+          - v0.5b-r8: host can switch Multitap compatibility live between controller-port-1 layout (BMX/downhill style) and controller-port-2 layout (START-to-join style).
+          - v0.5b-r8: live changes briefly pause every VM, reload the same pad topology, reset to a new input epoch, then resume through the first-poll barrier.
+          - v0.5b-r8: input/bundle packets carry an epoch so old in-flight packets cannot contaminate the new timeline.
+          - v0.5b-r8: Netplay windows are modeless/unowned, so the game window stays clickable and the Netplay UI may remain in the background.
           - v0.5b-r7: fix 3P/4P games which require START to join by preserving P2 on normal controller port 2.
           - v0.5b-r7: move the 3P/4P Multitap to controller port 2; mapping is now P1=0, P2=1, P3=5, P4=6.
           - v0.5b-r7: protocol bumped to v5 so older slot-topology builds cannot silently mix with this build.
@@ -205,7 +211,7 @@ jobs:
       - name: Upload Windows x64 Netplay build
         uses: actions/upload-artifact@v4
         with:
-          name: PCSX2-modern-netplay-windows-x64-v0.5b-r7
+          name: PCSX2-modern-netplay-windows-x64-v0.5b-r8
           path: src/bin
           if-no-files-found: error
           retention-days: 14
@@ -218,7 +224,7 @@ jobs:
           Compress-Archive -Path src\bin\* -DestinationPath $archive -CompressionLevel Optimal
           $channel = if ($env:GITHUB_REF -eq "refs/heads/master") { "stable" } else { "test" }
           $manifest = [ordered]@{
-            version = "v0.5b-r7"
+            version = "v0.5b-r8"
             channel = $channel
             control_sha = (Get-Content control\NETPLAY_CONTROL_SHA.txt -Raw).Trim()
             upstream_sha = (Get-Content control\PCSX2_UPSTREAM_SHA.txt -Raw).Trim()
@@ -265,7 +271,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir recovered
-          gh run download 35336516275 -n PCSX2-modern-netplay-windows-x64-v0.5b-r7 -D recovered
+          gh run download 35336516275 -n PCSX2-modern-netplay-windows-x64-v0.5b-r8 -D recovered
           test -f recovered/pcsx2-qt.exe
           test -f recovered/NETPLAY_CONTROL_SHA.txt
           test -f recovered/PCSX2_UPSTREAM_SHA.txt
@@ -275,7 +281,7 @@ jobs:
         run: |
           Compress-Archive -Path recovered/* -DestinationPath "$env:RUNNER_TEMP/PCSX2-modern-netplay-windows-x64.zip" -CompressionLevel Optimal
           $manifest = [ordered]@{
-            version = "v0.5b-r7"
+            version = "v0.5b-r8"
             channel = "test"
             control_sha = (Get-Content recovered/NETPLAY_CONTROL_SHA.txt -Raw).Trim()
             upstream_sha = (Get-Content recovered/PCSX2_UPSTREAM_SHA.txt -Raw).Trim()
