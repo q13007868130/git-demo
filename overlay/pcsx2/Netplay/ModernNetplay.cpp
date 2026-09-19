@@ -335,7 +335,7 @@ namespace
             return false;
         }
 
-        std::string base = Path::GetDirectory(manifest_path);
+        std::string base(Path::GetDirectory(manifest_path));
         const std::string subdir = ini.GetStringValue("data", "subdir", serial.c_str());
         if (!subdir.empty())
             base = Path::Combine(base, subdir);
