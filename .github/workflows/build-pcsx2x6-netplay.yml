@@ -51,6 +51,7 @@ jobs:
           Copy-Item control\overlay\pcsx2\Netplay\ModernNetplay.cpp src\pcsx2\Netplay\ModernNetplay.cpp -Force
           Copy-Item control\overlay\pcsx2-qt\NetplayDialog.h src\pcsx2-qt\NetplayDialog.h -Force
           Copy-Item control\overlay\pcsx2-qt\NetplayDialog.cpp src\pcsx2-qt\NetplayDialog.cpp -Force
+          Copy-Item control\overlay-pcsx2x6\pcsx2-qt\NetplayDialog.cpp src\pcsx2-qt\NetplayDialog.cpp -Force
           Copy-Item control\overlay-pcsx2x6\pcsx2\DEV9\ACJV.cpp src\pcsx2\DEV9\ACJV.cpp -Force
           & control\scripts\apply-pcsx2x6-netplay.ps1 -SourceRoot (Resolve-Path src)
           git -C src diff --check
@@ -101,6 +102,9 @@ jobs:
           Copy-Item control\PCSX2X6_UPSTREAM_SHA.txt src\bin\PCSX2X6_UPSTREAM_SHA.txt -Force
           Copy-Item control\PCSX2X6_UPSTREAM_VERSION.txt src\bin\PCSX2X6_UPSTREAM_VERSION.txt -Force
           Copy-Item control\NETPLAY_CONTROL_SHA.txt src\bin\NETPLAY_CONTROL_SHA.txt -Force
+          # Force portable mode so every PC reads configuration/resources from
+          # the shipped Netplay directory instead of unrelated Documents data.
+          New-Item -ItemType File -Force -Path src\bin\portable.txt | Out-Null
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.ps1 src\bin\Collect-Netplay-Diagnostics.ps1 -Force
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.bat src\bin\Collect-Netplay-Diagnostics.bat -Force
           @"
@@ -108,8 +112,8 @@ jobs:
           =========================================
           Base: PS2Homebrew-arcade/pcsx2x6 master
           Netplay protocol: current control-branch protocol
-          Status: core PCSX2 Netplay integration compile validation.
-          Arcade JVS authoritative-input synchronization is developed in the same branch and must be validated before this target is considered complete.
+          Status: PCSX2X6 dual-track Netplay with pre-boot environment validation.
+          Arcade: JVS authoritative input + GameIndex/.acgame/game-INI/boot/media/dongle validation + shadow Dongle/SRAM synchronization.
           "@ | Set-Content -Encoding UTF8 src\bin\NETPLAY_BUILD_INFO.txt
 
       - name: Upload Windows x64 PCSX2X6 Netplay build
