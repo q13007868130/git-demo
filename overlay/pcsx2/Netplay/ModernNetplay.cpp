@@ -7,6 +7,7 @@
 #include "Counters.h"
 #include "GameList.h"
 #include "Host.h"
+#include "INISettingsInterface.h"
 #include "VMManager.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
@@ -50,11 +51,40 @@ namespace
     using InputFrame = std::array<std::uint8_t, INPUT_FRAME_BYTES>;
     using InputBundle = std::array<InputFrame, MAX_PLAYERS>;
 
+    struct ArcadePaths
+    {
+        std::string manifest;
+        std::string boot;
+        std::string media;
+        std::string dongle_name;
+        std::string dongle;
+        std::string sram;
+        std::string game_settings;
+    };
+
+    struct DeterminismFingerprint
+    {
+        std::uint64_t build = 0;
+        std::uint64_t bios = 0;
+        std::uint64_t gamedb = 0;
+        std::uint64_t game_settings = 0;
+        std::uint64_t media = 0;
+        std::uint64_t arcade_manifest = 0;
+        std::uint64_t boot = 0;
+        std::uint64_t dongle = 0;
+    };
+
+    static constexpr std::uint32_t GAME_FLAG_ARCADE = 1u;
+    static constexpr std::size_t GAME_MANIFEST_SIZE = 8 + 32 + 160 + (8 * 8);
+    static constexpr std::uint32_t ARCADE_SESSION_MAGIC = 0x58364E50; // X6NP
+    static constexpr std::uint32_t ARCADE_SESSION_VERSION = 1;
+    static constexpr std::uint32_t ARCADE_SESSION_HEADER_SIZE = 16;
+
     constexpr std::uint32_t HELLO_MAGIC = 0x50324E50;   // P2NP
     constexpr std::uint32_t INPUT_MAGIC = 0x494E5054;   // INPT
     constexpr std::uint32_t BUNDLE_MAGIC = 0x424E444C;  // BNDL
     constexpr std::uint32_t CONTROL_MAGIC = 0x43544C31; // CTL1
-    constexpr std::uint32_t PROTOCOL_VERSION = 10;
+    constexpr std::uint32_t PROTOCOL_VERSION = 11;
     constexpr std::uint16_t DEFAULT_PORT = 27886;
     constexpr int RECEIVE_TIMEOUT_SECONDS = 30;
     constexpr int BOOT_BARRIER_TIMEOUT_SECONDS = 90;
@@ -217,6 +247,201 @@ namespace
             hash *= 1099511628211ull;
         }
         return hash;
+    }
+
+    bool HashFile64(const std::string& path, std::uint64_t* out_hash)
+    {
+        if (!out_hash || path.empty())
+            return false;
+
+        auto file = FileSystem::OpenManagedCFile(path.c_str(), "rb");
+        if (!file)
+            return false;
+
+        std::uint64_t hash = 1469598103934665603ull;
+        std::array<std::uint8_t, 1024 * 1024> buffer{};
+        for (;;)
+        {
+            const std::size_t count = std::fread(buffer.data(), 1, buffer.size(), file.get());
+            for (std::size_t i = 0; i < count; i++)
+            {
+                hash ^= buffer[i];
+                hash *= 1099511628211ull;
+            }
+            if (count < buffer.size())
+            {
+                if (std::ferror(file.get()))
+                    return false;
+                break;
+            }
+        }
+
+        *out_hash = hash;
+        return true;
+    }
+
+    std::uint64_t HashOptionalFile64(const std::string& path)
+    {
+        std::uint64_t hash = 0;
+        if (!path.empty() && FileSystem::FileExists(path.c_str()))
+            HashFile64(path, &hash);
+        return hash;
+    }
+
+    std::uint64_t MixHash64(std::uint64_t seed, std::uint64_t value)
+    {
+        return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2));
+    }
+
+    std::string ResolveGameSettingsPath(const std::string& serial, std::uint32_t crc, bool arcade)
+    {
+        if (arcade)
+        {
+            const std::string path = VMManager::GetGameSettingsPath(serial, 0);
+            return FileSystem::FileExists(path.c_str()) ? path : std::string();
+        }
+
+        std::string path = VMManager::GetGameSettingsPath(serial, crc);
+        if (FileSystem::FileExists(path.c_str()))
+            return path;
+        if (!serial.empty())
+        {
+            path = VMManager::GetGameSettingsPath(serial, 0);
+            if (FileSystem::FileExists(path.c_str()))
+                return path;
+        }
+        path = VMManager::GetGameSettingsPath({}, crc);
+        return FileSystem::FileExists(path.c_str()) ? path : std::string();
+    }
+
+    bool ResolveArcadePaths(const std::string& manifest_path, const std::string& expected_serial,
+        ArcadePaths* out, std::string* error)
+    {
+        if (!out || manifest_path.empty())
+            return false;
+
+        INISettingsInterface ini(manifest_path);
+        if (!ini.Load())
+        {
+            if (error) *error = "无法读取街机 .acgame 配置";
+            return false;
+        }
+
+        const std::string serial = ini.GetStringValue("game", "gameid");
+        if (serial.empty() || (!expected_serial.empty() && !StringUtil::compareNoCase(serial, expected_serial)))
+        {
+            if (error) *error = "街机 .acgame 的 gameid 与房间游戏不一致";
+            return false;
+        }
+
+        std::string base = Path::GetDirectory(manifest_path);
+        const std::string subdir = ini.GetStringValue("data", "subdir", serial.c_str());
+        if (!subdir.empty())
+            base = Path::Combine(base, subdir);
+
+        ArcadePaths paths{};
+        paths.manifest = manifest_path;
+        paths.boot = Path::Combine(base, ini.GetStringValue("data", "elf", "boot.elf"));
+        paths.media = Path::Combine(base, ini.GetStringValue("data", "mediasrc", fmt::format("{}.chd", serial).c_str()));
+        paths.dongle_name = ini.GetStringValue("data", "dongle", fmt::format("{}.ps2", serial).c_str());
+        paths.dongle = Path::Combine(EmuFolders::MemoryCards, paths.dongle_name);
+        paths.sram = Path::Combine(base, ini.GetStringValue("data", "sram", "sram.bin"));
+        paths.game_settings = ResolveGameSettingsPath(serial, 0, true);
+        *out = std::move(paths);
+        return true;
+    }
+
+    bool BuildDeterminismFingerprint(const std::string& selected_path, const std::string& serial,
+        std::uint32_t crc, bool arcade, DeterminismFingerprint* out, std::string* error)
+    {
+        if (!out)
+            return false;
+
+        DeterminismFingerprint fp{};
+        const std::string upstream_sha = Path::Combine(EmuFolders::AppRoot, "PCSX2X6_UPSTREAM_SHA.txt");
+        const std::string control_sha = Path::Combine(EmuFolders::AppRoot, "NETPLAY_CONTROL_SHA.txt");
+        const std::uint64_t upstream_hash = HashOptionalFile64(upstream_sha);
+        const std::uint64_t control_hash = HashOptionalFile64(control_sha);
+        fp.build = MixHash64(upstream_hash, control_hash);
+        if (upstream_hash == 0 || control_hash == 0)
+        {
+            if (error) *error = "缺少 PCSX2X6 联机版本标识文件，请重新下载完整联机包";
+            return false;
+        }
+
+        if (!HashFile64(EmuConfig.FullpathToBios(), &fp.bios))
+        {
+            if (error) *error = "无法读取当前 BIOS，无法校验街机联机环境";
+            return false;
+        }
+
+        const std::string gamedb_path = Path::Combine(EmuFolders::Resources, "GameIndex.yaml");
+        if (!HashFile64(gamedb_path, &fp.gamedb))
+        {
+            if (error) *error = "无法读取 resources/GameIndex.yaml";
+            return false;
+        }
+
+        if (!arcade)
+        {
+            fp.game_settings = HashOptionalFile64(ResolveGameSettingsPath(serial, crc, false));
+            if (!HashFile64(selected_path, &fp.media))
+            {
+                if (error) *error = "无法读取所选 PS2 游戏镜像进行一致性校验";
+                return false;
+            }
+            *out = fp;
+            return true;
+        }
+
+        ArcadePaths paths{};
+        if (!ResolveArcadePaths(selected_path, serial, &paths, error))
+            return false;
+        if (!HashFile64(paths.manifest, &fp.arcade_manifest))
+        {
+            if (error) *error = "无法读取街机 .acgame";
+            return false;
+        }
+        if (!HashFile64(paths.boot, &fp.boot))
+        {
+            if (error) *error = "无法读取街机 boot.elf";
+            return false;
+        }
+        if (!HashFile64(paths.media, &fp.media))
+        {
+            if (error) *error = "无法读取街机 CHD/DVD/HDD 镜像";
+            return false;
+        }
+        if (!HashFile64(paths.dongle, &fp.dongle))
+        {
+            if (error) *error = "无法读取街机 Dongle：" + paths.dongle_name;
+            return false;
+        }
+        fp.game_settings = HashOptionalFile64(paths.game_settings);
+        *out = fp;
+        return true;
+    }
+
+    std::string DescribeFingerprintMismatch(const DeterminismFingerprint& host,
+        const DeterminismFingerprint& local, bool arcade)
+    {
+        std::string reason;
+        const auto add = [&reason](const char* name) {
+            if (!reason.empty()) reason += "、";
+            reason += name;
+        };
+        if (host.build != local.build) add("联机/PCSX2X6版本");
+        if (host.bios != local.bios) add("BIOS");
+        if (host.gamedb != local.gamedb) add("GameIndex.yaml");
+        if (host.game_settings != local.game_settings) add("游戏专用INI");
+        if (host.media != local.media) add(arcade ? "街机游戏媒体" : "游戏镜像");
+        if (arcade)
+        {
+            if (host.arcade_manifest != local.arcade_manifest) add(".acgame");
+            if (host.boot != local.boot) add("boot.elf");
+            if (host.dongle != local.dongle) add("Dongle");
+        }
+        return reason;
     }
 
     bool SendAll(SOCKET socket, const void* data, std::size_t size)
@@ -451,9 +676,24 @@ namespace
         bool HostSelectGame(const std::string& path, const std::string& title,
             const std::string& serial, std::uint32_t crc)
         {
-            if (m_role != Role::Host || path.empty() || serial.empty() || crc == 0 ||
-                VMManager::HasValidVM())
+            const bool arcade = VMManager::isArcadeManifest(path.c_str());
+            if (m_role != Role::Host || path.empty() || serial.empty() ||
+                (!arcade && crc == 0) || VMManager::HasValidVM())
                 return false;
+            if (arcade && m_room_capacity > 2)
+            {
+                SetLastError("System 246/256 JVS 街机联机当前支持 1～2 人，请先把房间人数调到 2 人以内");
+                return false;
+            }
+
+            DeterminismFingerprint fingerprint{};
+            std::string fingerprint_error;
+            if (!BuildDeterminismFingerprint(path, serial, crc, arcade, &fingerprint, &fingerprint_error))
+            {
+                SetLastError(fingerprint_error.c_str());
+                Log("determinism fingerprint failed: %s", fingerprint_error.c_str());
+                return false;
+            }
 
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
@@ -469,13 +709,24 @@ namespace
                 m_game_serial = serial;
                 m_game_crc = crc;
                 m_local_game_path = path;
+                m_game_is_arcade = arcade;
+                m_game_fingerprint = fingerprint;
                 m_last_error.clear();
                 ResetStartStateLocked();
                 for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
                     m_players[i].game_match = (i == 0 && i < m_max_players);
             }
 
-            Log("host selected game: title=%s serial=%s crc=%08X", title.c_str(), serial.c_str(), crc);
+            Log("host selected game: title=%s serial=%s crc=%08X arcade=%s build=%016llX bios=%016llX gamedb=%016llX gameini=%016llX media=%016llX acgame=%016llX boot=%016llX dongle=%016llX",
+                title.c_str(), serial.c_str(), crc, arcade ? "yes" : "no",
+                static_cast<unsigned long long>(fingerprint.build),
+                static_cast<unsigned long long>(fingerprint.bios),
+                static_cast<unsigned long long>(fingerprint.gamedb),
+                static_cast<unsigned long long>(fingerprint.game_settings),
+                static_cast<unsigned long long>(fingerprint.media),
+                static_cast<unsigned long long>(fingerprint.arcade_manifest),
+                static_cast<unsigned long long>(fingerprint.boot),
+                static_cast<unsigned long long>(fingerprint.dongle));
             BroadcastRoster();
             if (!BroadcastGameManifest())
             {
@@ -812,6 +1063,20 @@ namespace
             return SynchronizeArcadeJvsInternal(local_state, bundle);
         }
 
+        std::string GetArcadeDongleOverrideImpl(const std::string& original_filename) const
+        {
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            return (m_game_is_arcade && m_memory_card_local_ready && !m_shadow_card_filename.empty()) ?
+                m_shadow_card_filename : original_filename;
+        }
+
+        std::string GetArcadeSramOverrideImpl(const std::string& original_path) const
+        {
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            return (m_game_is_arcade && m_memory_card_local_ready && !m_shadow_arcade_sram_path.empty()) ?
+                m_shadow_arcade_sram_path : original_path;
+        }
+
     private:
         const char* RoleName() const
         {
@@ -1005,6 +1270,7 @@ namespace
             m_memcard_receive.clear();
             m_memory_card_status = m_memory_card_sync_enabled ? "等待记忆卡同步" : "记忆卡同步已关闭";
             m_shadow_card_filename.clear();
+            m_shadow_arcade_sram_path.clear();
             m_prepare_boot = false;
             m_boot_launch_pending = false;
             m_boot_launch_consumed = false;
@@ -1474,15 +1740,24 @@ namespace
             BroadcastControl(ControlType::Roster, payload.data(), static_cast<std::uint32_t>(payload.size()));
         }
 
-        bool BuildGameManifest(std::array<std::uint8_t, 4 + 32 + 160>* payload) const
+        bool BuildGameManifest(std::array<std::uint8_t, GAME_MANIFEST_SIZE>* payload) const
         {
             std::lock_guard<std::mutex> lock(m_state_mutex);
             if (!m_game_selected)
                 return false;
             payload->fill(0);
-            WriteU32(payload->data(), m_game_crc);
-            std::snprintf(reinterpret_cast<char*>(payload->data() + 4), 32, "%s", m_game_serial.c_str());
-            std::snprintf(reinterpret_cast<char*>(payload->data() + 36), 160, "%s", m_game_title.c_str());
+            WriteU32(payload->data() + 0, m_game_crc);
+            WriteU32(payload->data() + 4, m_game_is_arcade ? GAME_FLAG_ARCADE : 0u);
+            std::snprintf(reinterpret_cast<char*>(payload->data() + 8), 32, "%s", m_game_serial.c_str());
+            std::snprintf(reinterpret_cast<char*>(payload->data() + 40), 160, "%s", m_game_title.c_str());
+            WriteU64(payload->data() + 200, m_game_fingerprint.build);
+            WriteU64(payload->data() + 208, m_game_fingerprint.bios);
+            WriteU64(payload->data() + 216, m_game_fingerprint.gamedb);
+            WriteU64(payload->data() + 224, m_game_fingerprint.game_settings);
+            WriteU64(payload->data() + 232, m_game_fingerprint.media);
+            WriteU64(payload->data() + 240, m_game_fingerprint.arcade_manifest);
+            WriteU64(payload->data() + 248, m_game_fingerprint.boot);
+            WriteU64(payload->data() + 256, m_game_fingerprint.dongle);
             return true;
         }
 
@@ -1490,7 +1765,7 @@ namespace
         {
             if (m_max_players == 1)
                 return true;
-            std::array<std::uint8_t, 4 + 32 + 160> payload{};
+            std::array<std::uint8_t, GAME_MANIFEST_SIZE> payload{};
             if (!BuildGameManifest(&payload))
                 return false;
             BroadcastControl(ControlType::GameManifest, payload.data(), static_cast<std::uint32_t>(payload.size()));
@@ -1499,7 +1774,7 @@ namespace
 
         bool SendGameManifestToPeer(Peer& peer)
         {
-            std::array<std::uint8_t, 4 + 32 + 160> payload{};
+            std::array<std::uint8_t, GAME_MANIFEST_SIZE> payload{};
             if (!BuildGameManifest(&payload))
                 return false;
             return SendControlToPeer(peer, ControlType::GameManifest, payload.data(), static_cast<std::uint32_t>(payload.size()));
@@ -1542,11 +1817,13 @@ namespace
 
         void HandleGameManifest(const std::vector<std::uint8_t>& payload)
         {
-            if (m_role != Role::Client || payload.size() != (4 + 32 + 160))
+            if (m_role != Role::Client || payload.size() != GAME_MANIFEST_SIZE)
                 return;
-            const std::uint32_t crc = ReadU32(payload.data());
-            const char* serial_ptr = reinterpret_cast<const char*>(payload.data() + 4);
-            const char* title_ptr = reinterpret_cast<const char*>(payload.data() + 36);
+
+            const std::uint32_t crc = ReadU32(payload.data() + 0);
+            const bool arcade = (ReadU32(payload.data() + 4) & GAME_FLAG_ARCADE) != 0;
+            const char* serial_ptr = reinterpret_cast<const char*>(payload.data() + 8);
+            const char* title_ptr = reinterpret_cast<const char*>(payload.data() + 40);
             std::size_t serial_len = 0;
             while (serial_len < 32 && serial_ptr[serial_len] != '\0')
                 ++serial_len;
@@ -1556,6 +1833,16 @@ namespace
             const std::string serial(serial_ptr, serial_len);
             const std::string title(title_ptr, title_len);
 
+            DeterminismFingerprint host_fp{};
+            host_fp.build = ReadU64(payload.data() + 200);
+            host_fp.bios = ReadU64(payload.data() + 208);
+            host_fp.gamedb = ReadU64(payload.data() + 216);
+            host_fp.game_settings = ReadU64(payload.data() + 224);
+            host_fp.media = ReadU64(payload.data() + 232);
+            host_fp.arcade_manifest = ReadU64(payload.data() + 240);
+            host_fp.boot = ReadU64(payload.data() + 248);
+            host_fp.dongle = ReadU64(payload.data() + 256);
+
             std::string local_path;
             {
                 auto lock = GameList::GetLock();
@@ -1563,7 +1850,24 @@ namespace
                 if (entry)
                     local_path = entry->path;
             }
-            const bool matched = !local_path.empty();
+
+            const bool local_arcade = !local_path.empty() && VMManager::isArcadeManifest(local_path.c_str());
+            DeterminismFingerprint local_fp{};
+            std::string fingerprint_error;
+            bool matched = !local_path.empty() && (local_arcade == arcade) &&
+                BuildDeterminismFingerprint(local_path, serial, crc, arcade, &local_fp, &fingerprint_error);
+            std::string mismatch;
+            if (matched)
+            {
+                mismatch = DescribeFingerprintMismatch(host_fp, local_fp, arcade);
+                matched = mismatch.empty();
+            }
+            else if (fingerprint_error.empty())
+            {
+                fingerprint_error = local_path.empty() ?
+                    "本机没有找到相同的游戏" : "本机游戏类型与房主不一致";
+            }
+
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 m_game_selected = true;
@@ -1571,25 +1875,103 @@ namespace
                 m_game_serial = serial;
                 m_game_crc = crc;
                 m_local_game_path = local_path;
+                m_game_is_arcade = arcade;
+                m_game_fingerprint = host_fp;
                 m_local_game_match = matched;
-                m_last_error.clear();
                 ResetStartStateLocked();
+                m_game_is_arcade = arcade;
+                m_game_fingerprint = host_fp;
+                m_last_error = matched ? std::string() :
+                    ("联机启动环境不一致：" + (!mismatch.empty() ? mismatch : fingerprint_error));
                 if (m_local_player_id >= 1 && m_local_player_id <= MAX_PLAYERS)
                     m_players[m_local_player_id - 1].game_match = matched;
                 m_players[0].game_match = true;
             }
+
             std::array<std::uint8_t, 8> reply{};
             WriteU32(reply.data(), m_local_player_id);
             WriteU32(reply.data() + 4, matched ? 1u : 0u);
             SendControlToHost(ControlType::GameMatch, reply.data(), static_cast<std::uint32_t>(reply.size()));
-            Log("GAME_MANIFEST: title=%s serial=%s crc=%08X local_match=%s",
-                title.c_str(), serial.c_str(), crc, matched ? "yes" : "no");
+            Log("GAME_MANIFEST: title=%s serial=%s crc=%08X arcade=%s local_match=%s mismatch=%s",
+                title.c_str(), serial.c_str(), crc, arcade ? "yes" : "no",
+                matched ? "yes" : "no",
+                mismatch.empty() ? fingerprint_error.c_str() : mismatch.c_str());
+        }
+
+        bool ExportArcadeSessionState(std::vector<std::uint8_t>* data, bool* present, std::string* error)
+        {
+            std::string path;
+            std::string serial;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                path = m_local_game_path;
+                serial = m_game_serial;
+            }
+
+            ArcadePaths paths{};
+            if (!ResolveArcadePaths(path, serial, &paths, error))
+                return false;
+
+            const std::optional<std::vector<u8>> dongle = FileSystem::ReadBinaryFile(paths.dongle.c_str());
+            if (!dongle.has_value() || dongle->empty())
+            {
+                if (error) *error = "无法读取房主街机 Dongle：" + paths.dongle_name;
+                return false;
+            }
+
+            std::vector<u8> sram;
+            if (FileSystem::FileExists(paths.sram.c_str()))
+            {
+                const std::optional<std::vector<u8>> read_sram = FileSystem::ReadBinaryFile(paths.sram.c_str());
+                if (!read_sram.has_value())
+                {
+                    if (error) *error = "无法读取房主街机 sram.bin";
+                    return false;
+                }
+                sram = *read_sram;
+            }
+
+            if (dongle->size() > (32u * 1024u * 1024u) || sram.size() > (32u * 1024u * 1024u))
+            {
+                if (error) *error = "街机 Dongle 或 SRAM 文件大小异常";
+                return false;
+            }
+
+            const std::size_t total = ARCADE_SESSION_HEADER_SIZE + dongle->size() + sram.size();
+            if (total > (80u * 1024u * 1024u))
+            {
+                if (error) *error = "街机联机状态包过大";
+                return false;
+            }
+
+            data->assign(total, 0);
+            WriteU32(data->data() + 0, ARCADE_SESSION_MAGIC);
+            WriteU32(data->data() + 4, ARCADE_SESSION_VERSION);
+            WriteU32(data->data() + 8, static_cast<std::uint32_t>(dongle->size()));
+            WriteU32(data->data() + 12, static_cast<std::uint32_t>(sram.size()));
+            std::memcpy(data->data() + ARCADE_SESSION_HEADER_SIZE, dongle->data(), dongle->size());
+            if (!sram.empty())
+                std::memcpy(data->data() + ARCADE_SESSION_HEADER_SIZE + dongle->size(), sram.data(), sram.size());
+
+            *present = true;
+            Log("arcade session state prepared: dongle=%s bytes=%u sram=%s bytes=%u",
+                paths.dongle_name.c_str(), static_cast<unsigned>(dongle->size()),
+                sram.empty() ? "blank" : paths.sram.c_str(), static_cast<unsigned>(sram.size()));
+            return true;
         }
 
         bool ExportConfiguredMemoryCard(std::vector<std::uint8_t>* data, bool* present, std::string* error)
         {
             data->clear();
             *present = false;
+
+            bool arcade = false;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                arcade = m_game_is_arcade;
+            }
+            if (arcade)
+                return ExportArcadeSessionState(data, present, error);
 
             // The Netplay lobby runs before VM settings/type auto-detection.
             // Read the actual base Slot 1 selection and inspect the filesystem
@@ -1700,6 +2082,12 @@ namespace
 
         bool WriteShadowCard(const std::vector<std::uint8_t>& data, bool present, std::string* out_filename)
         {
+            bool arcade = false;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                arcade = m_game_is_arcade;
+            }
+
             if (!present)
             {
                 out_filename->clear();
@@ -1711,6 +2099,69 @@ namespace
             {
                 Log("failed to create memory-card directory: %s", EmuFolders::MemoryCards.c_str());
                 return false;
+            }
+
+            if (arcade)
+            {
+                if (data.size() < ARCADE_SESSION_HEADER_SIZE ||
+                    ReadU32(data.data() + 0) != ARCADE_SESSION_MAGIC ||
+                    ReadU32(data.data() + 4) != ARCADE_SESSION_VERSION)
+                {
+                    Log("invalid PCSX2X6 arcade session-state package");
+                    return false;
+                }
+
+                const std::uint32_t dongle_size = ReadU32(data.data() + 8);
+                const std::uint32_t sram_size = ReadU32(data.data() + 12);
+                const std::size_t expected = ARCADE_SESSION_HEADER_SIZE +
+                    static_cast<std::size_t>(dongle_size) + static_cast<std::size_t>(sram_size);
+                if (expected != data.size() || dongle_size == 0)
+                {
+                    Log("invalid arcade session-state sizes");
+                    return false;
+                }
+
+                char dongle_name[96]{};
+                std::snprintf(dongle_name, sizeof(dongle_name), "NetplayX6Dongle-%016llX.ps2",
+                    static_cast<unsigned long long>(m_session_id));
+                const std::string dongle_path = Path::Combine(EmuFolders::MemoryCards, dongle_name);
+                if (!FileSystem::WriteBinaryFile(dongle_path.c_str(),
+                        data.data() + ARCADE_SESSION_HEADER_SIZE, dongle_size))
+                {
+                    Log("failed to write Netplay X6 shadow dongle: %s", dongle_path.c_str());
+                    return false;
+                }
+
+                const std::string state_dir = Path::Combine(EmuFolders::DataRoot, "netplay");
+                if (!FileSystem::DirectoryExists(state_dir.c_str()) &&
+                    !FileSystem::CreateDirectoryPath(state_dir.c_str(), true))
+                {
+                    FileSystem::DeleteFilePath(dongle_path.c_str());
+                    Log("failed to create Netplay X6 state directory: %s", state_dir.c_str());
+                    return false;
+                }
+
+                char sram_name[96]{};
+                std::snprintf(sram_name, sizeof(sram_name), "NetplayX6SRAM-%016llX.bin",
+                    static_cast<unsigned long long>(m_session_id));
+                const std::string sram_path = Path::Combine(state_dir, sram_name);
+                FileSystem::DeleteFilePath(sram_path.c_str());
+                if (sram_size > 0 && !FileSystem::WriteBinaryFile(sram_path.c_str(),
+                        data.data() + ARCADE_SESSION_HEADER_SIZE + dongle_size, sram_size))
+                {
+                    FileSystem::DeleteFilePath(dongle_path.c_str());
+                    Log("failed to write Netplay X6 shadow SRAM: %s", sram_path.c_str());
+                    return false;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(m_state_mutex);
+                    m_shadow_arcade_sram_path = sram_path;
+                }
+                *out_filename = dongle_name;
+                Log("Netplay X6 shadows written: dongle=%s sram=%s sram_bytes=%u",
+                    dongle_path.c_str(), sram_path.c_str(), static_cast<unsigned>(sram_size));
+                return true;
             }
 
             char name[96]{};
@@ -1793,8 +2244,9 @@ namespace
                 m_shadow_card_filename = shadow;
                 m_memory_card_local_ready = true;
                 m_players[0].memcard_ready = true;
-                m_memory_card_status = present ?
-                    "正在发送房主记忆卡临时副本" : "房主未插入记忆卡，正在同步无卡状态";
+                m_memory_card_status = m_game_is_arcade ?
+                    "正在同步街机 Dongle + SRAM 临时状态" :
+                    (present ? "正在发送房主记忆卡临时副本" : "房主未插入记忆卡，正在同步无卡状态");
             }
 
             std::array<std::uint8_t, 16> begin{};
@@ -1862,8 +2314,9 @@ namespace
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 m_memory_card_transferred_bytes = data.size();
-                m_memory_card_status = present ?
-                    "记忆卡发送完成，等待其他玩家校验" : "无卡状态已发送，等待其他玩家确认";
+                m_memory_card_status = m_game_is_arcade ?
+                    "街机 Dongle + SRAM 已发送，等待其他玩家校验" :
+                    (present ? "记忆卡发送完成，等待其他玩家校验" : "无卡状态已发送，等待其他玩家确认");
             }
 
             BroadcastRoster();
@@ -1894,7 +2347,9 @@ namespace
             m_memory_card_transfer_active = true;
             m_memory_card_failed = false;
             m_memory_card_local_ready = false;
-            m_memory_card_status = present ? "正在接收房主记忆卡临时副本" : "正在接收房主无卡状态";
+            m_memory_card_status = m_game_is_arcade ?
+                "正在接收房主街机 Dongle + SRAM 临时状态" :
+                (present ? "正在接收房主记忆卡临时副本" : "正在接收房主无卡状态");
         }
 
         void HandleClientMemcardChunk(const std::vector<std::uint8_t>& payload)
@@ -1945,8 +2400,10 @@ namespace
                 if (m_local_player_id >= 1 && m_local_player_id <= MAX_PLAYERS)
                     m_players[m_local_player_id - 1].memcard_ready = ok;
                 m_memory_card_status = ok ?
-                    (present ? "记忆卡同步完成 ✓（使用联机临时副本）" : "无记忆卡状态同步完成 ✓") :
-                    "记忆卡同步失败：大小或校验值不一致";
+                    (m_game_is_arcade ? "街机 Dongle + SRAM 同步完成 ✓（使用联机临时副本）" :
+                        (present ? "记忆卡同步完成 ✓（使用联机临时副本）" : "无记忆卡状态同步完成 ✓")) :
+                    (m_game_is_arcade ? "街机 Dongle/SRAM 同步失败：大小或校验值不一致" :
+                        "记忆卡同步失败：大小或校验值不一致");
                 m_memcard_receive.clear();
             }
 
@@ -2527,6 +2984,8 @@ namespace
                 m_game_serial.clear();
                 m_game_crc = 0;
                 m_local_game_path.clear();
+                m_game_is_arcade = false;
+                m_game_fingerprint = {};
                 ResetStartStateLocked();
                 m_max_players = m_room_capacity;
                 for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
@@ -3490,6 +3949,8 @@ namespace
         std::string m_game_serial;
         std::uint32_t m_game_crc = 0;
         std::string m_local_game_path;
+        bool m_game_is_arcade = false;
+        DeterminismFingerprint m_game_fingerprint{};
 
         bool m_start_requested = false;
         bool m_memcard_transfer_started = false;
@@ -3502,6 +3963,7 @@ namespace
         std::uint64_t m_memory_card_transferred_bytes = 0;
         std::string m_memory_card_status = "等待记忆卡同步";
         std::string m_shadow_card_filename;
+        std::string m_shadow_arcade_sram_path;
         std::vector<std::uint8_t> m_memcard_receive;
         std::uint64_t m_memcard_received_bytes = 0;
 
@@ -3623,6 +4085,14 @@ bool SynchronizeArcadeJvs(const ArcadeJvsState& local_state, ArcadeJvsBundle* bu
 {
     return GetSession().SynchronizeArcadeJvsImpl(local_state, bundle);
 }
+std::string GetArcadeDongleOverride(const std::string& original_filename)
+{
+    return GetSession().GetArcadeDongleOverrideImpl(original_filename);
+}
+std::string GetArcadeSramOverride(const std::string& original_path)
+{
+    return GetSession().GetArcadeSramOverrideImpl(original_path);
+}
 void Shutdown() { GetSession().Stop(); }
 #else
 bool IsCustomBuild() { return true; }
@@ -3645,6 +4115,8 @@ bool ShouldForceDualShock2Slot(std::uint32_t) { return false; }
 bool ShouldDisconnectControllerSlot(std::uint32_t) { return false; }
 std::uint8_t HandlePadResponse(std::uint8_t, std::uint32_t, std::uint8_t local_value) { return local_value; }
 bool SynchronizeArcadeJvs(const ArcadeJvsState&, ArcadeJvsBundle*) { return false; }
+std::string GetArcadeDongleOverride(const std::string& original_filename) { return original_filename; }
+std::string GetArcadeSramOverride(const std::string& original_path) { return original_path; }
 void Shutdown() {}
 #endif
 } // namespace ModernNetplay
