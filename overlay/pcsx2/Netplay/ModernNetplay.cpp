@@ -11,6 +11,7 @@
 #include "VMManager.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
+#include "common/StringUtil.h"
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Memcard/MemoryCardFolder.h"
 #include "SIO/Pad/Pad.h"
@@ -342,8 +343,8 @@ namespace
         ArcadePaths paths{};
         paths.manifest = manifest_path;
         paths.boot = Path::Combine(base, ini.GetStringValue("data", "elf", "boot.elf"));
-        paths.media = Path::Combine(base, ini.GetStringValue("data", "mediasrc", fmt::format("{}.chd", serial).c_str()));
-        paths.dongle_name = ini.GetStringValue("data", "dongle", fmt::format("{}.ps2", serial).c_str());
+        paths.media = Path::Combine(base, ini.GetStringValue("data", "mediasrc", (serial + ".chd").c_str()));
+        paths.dongle_name = ini.GetStringValue("data", "dongle", (serial + ".ps2").c_str());
         paths.dongle = Path::Combine(EmuFolders::MemoryCards, paths.dongle_name);
         paths.sram = Path::Combine(base, ini.GetStringValue("data", "sram", "sram.bin"));
         paths.game_settings = ResolveGameSettingsPath(serial, 0, true);
@@ -683,6 +684,11 @@ namespace
             if (arcade && m_room_capacity > 2)
             {
                 SetLastError("System 246/256 JVS 街机联机当前支持 1～2 人，请先把房间人数调到 2 人以内");
+                return false;
+            }
+            if (arcade && !m_memory_card_sync_enabled)
+            {
+                SetLastError("System 246/256 街机联机必须启用状态同步，以同步 Dongle 和 SRAM");
                 return false;
             }
 
@@ -1025,16 +1031,25 @@ namespace
             }
 
             std::string shadow_to_remove;
+            std::string shadow_sram_to_remove;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 shadow_to_remove = m_shadow_card_filename;
+                shadow_sram_to_remove = m_shadow_arcade_sram_path;
                 m_shadow_card_filename.clear();
+                m_shadow_arcade_sram_path.clear();
             }
             if (!shadow_to_remove.empty())
             {
                 const std::string shadow_path = Path::Combine(EmuFolders::MemoryCards, shadow_to_remove);
                 const bool removed = FileSystem::DeleteFilePath(shadow_path.c_str());
-                Log("removed Netplay shadow card: %s%s", shadow_to_remove.c_str(),
+                Log("removed Netplay shadow card/dongle: %s%s", shadow_to_remove.c_str(),
+                    removed ? "" : " (cleanup warning)");
+            }
+            if (!shadow_sram_to_remove.empty())
+            {
+                const bool removed = FileSystem::DeleteFilePath(shadow_sram_to_remove.c_str());
+                Log("removed Netplay X6 shadow SRAM: %s%s", shadow_sram_to_remove.c_str(),
                     removed ? "" : " (cleanup warning)");
             }
 
@@ -2186,12 +2201,14 @@ namespace
             std::uint64_t transferred = 0;
             bool present = false;
             std::string shadow_to_remove;
+            std::string shadow_sram_to_remove;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 total = m_memory_card_size;
                 transferred = m_memory_card_transferred_bytes;
                 present = m_memory_card_present;
                 shadow_to_remove = m_shadow_card_filename;
+                shadow_sram_to_remove = m_shadow_arcade_sram_path;
                 ResetStartStateLocked();
                 m_memory_card_present = present;
                 m_memory_card_size = total;
@@ -2207,6 +2224,8 @@ namespace
                 const std::string shadow_path = Path::Combine(EmuFolders::MemoryCards, shadow_to_remove);
                 FileSystem::DeleteFilePath(shadow_path.c_str());
             }
+            if (!shadow_sram_to_remove.empty())
+                FileSystem::DeleteFilePath(shadow_sram_to_remove.c_str());
 
             Log("START_CANCELLED: %s", message.c_str());
             if (m_role == Role::Host)
@@ -2426,6 +2445,7 @@ namespace
                 std::string(reinterpret_cast<const char*>(payload.data()), payload.size());
 
             std::string shadow_to_remove;
+            std::string shadow_sram_to_remove;
             std::uint32_t total = 0;
             std::uint64_t received = 0;
             bool present = false;
@@ -2435,6 +2455,7 @@ namespace
                 received = m_memcard_received_bytes;
                 present = m_memory_card_present;
                 shadow_to_remove = m_shadow_card_filename;
+                shadow_sram_to_remove = m_shadow_arcade_sram_path;
                 ResetStartStateLocked();
                 m_memory_card_present = present;
                 m_memory_card_size = total;
@@ -2450,6 +2471,8 @@ namespace
                 const std::string shadow_path = Path::Combine(EmuFolders::MemoryCards, shadow_to_remove);
                 FileSystem::DeleteFilePath(shadow_path.c_str());
             }
+            if (!shadow_sram_to_remove.empty())
+                FileSystem::DeleteFilePath(shadow_sram_to_remove.c_str());
 
             Log("MEMCARD_ABORT received: %s", reason.c_str());
         }
