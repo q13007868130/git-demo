@@ -142,5 +142,11 @@ namespace ModernNetplay
     // state to every VM before the emulated JVS board answers the game.
     bool SynchronizeArcadeJvs(const ArcadeJvsState& local_state, ArcadeJvsBundle* bundle);
 
+    // PCSX2X6 arcade boot redirection. During Netplay the original security
+    // dongle and SRAM are never used directly; both point at synchronized
+    // per-session shadow files prepared before PREPARE_BOOT.
+    std::string GetArcadeDongleOverride(const std::string& original_filename);
+    std::string GetArcadeSramOverride(const std::string& original_path);
+
     void Shutdown();
 } // namespace ModernNetplay
