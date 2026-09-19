@@ -49,6 +49,7 @@ jobs:
           Copy-Item control\overlay\pcsx2\Netplay\ModernNetplay.cpp src\pcsx2\Netplay\ModernNetplay.cpp -Force
           Copy-Item control\overlay\pcsx2-qt\NetplayDialog.h src\pcsx2-qt\NetplayDialog.h -Force
           Copy-Item control\overlay\pcsx2-qt\NetplayDialog.cpp src\pcsx2-qt\NetplayDialog.cpp -Force
+          Copy-Item control\overlay-pcsx2x6\pcsx2\DEV9\ACJV.cpp src\pcsx2\DEV9\ACJV.cpp -Force
           & control\scripts\apply-pcsx2x6-netplay.ps1 -SourceRoot (Resolve-Path src)
           git -C src diff --check
           git -C src diff -- pcsx2/SIO/Pad/Pad.cpp pcsx2/SIO/Pad/PadDualshock2.cpp pcsx2/VMManager.cpp pcsx2/Patch.cpp pcsx2/CMakeLists.txt pcsx2-qt/MainWindow.cpp pcsx2-qt/AutoUpdaterDialog.cpp pcsx2-qt/QtHost.cpp pcsx2-qt/CMakeLists.txt
