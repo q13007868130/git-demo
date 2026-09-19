@@ -109,6 +109,27 @@ if ($text -notmatch 'ModernNetplay::ApplyDeterministicConfig\(\)') {
     if (-not $text.Contains($needle)) { throw 'VMManager.cpp LoadCoreSettings anchor not found' }
     $text = $text.Replace($needle, "`tModernNetplay::ApplyDeterministicConfig();`r`n$needle")
 }
+
+# PCSX2X6 arcade Netplay shadows: the .acgame still selects the correct logical
+# dongle/SRAM, but the VM is redirected to the synchronized per-session copies.
+if ($text -notmatch 'GetArcadeDongleOverride') {
+    $oldDongle = @'
+				if ((card = INI.GetStringValue("data", "dongle", fmt::format("{}.ps2", s_serial).c_str())) != "") {
+					std::string src = Path::Combine(EmuFolders::MemoryCards, card);
+'@
+    $newDongle = @'
+				if ((card = INI.GetStringValue("data", "dongle", fmt::format("{}.ps2", s_serial).c_str())) != "") {
+					card = ModernNetplay::GetArcadeDongleOverride(card);
+					std::string src = Path::Combine(EmuFolders::MemoryCards, card);
+'@
+    $text = Replace-Portable $text $oldDongle $newDongle 'VMManager.cpp arcade dongle anchor not found'
+}
+if ($text -notmatch 'GetArcadeSramOverride') {
+    $oldSram = '				ACSRAM::filepath = Path::Combine(basedir, INI.GetStringValue("data", "sram", "sram.bin"));'
+    $newSram = '				ACSRAM::filepath = ModernNetplay::GetArcadeSramOverride(Path::Combine(basedir, INI.GetStringValue("data", "sram", "sram.bin")));'
+    if (-not $text.Contains($oldSram)) { throw 'VMManager.cpp arcade SRAM anchor not found' }
+    $text = $text.Replace($oldSram, $newSram)
+}
 Write-Text $vmManager $text
 
 # Netplay determinism: keep PCSX2's shared GameDB compatibility patches, but do
