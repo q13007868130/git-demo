@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   windows-x64:
-    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[release-only]') }}
+    if: ${{ github.ref != 'refs/heads/feature/pcsx2x6-modern-netplay' && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[release-only]')) }}
     runs-on: windows-2025
     timeout-minutes: 120
     env:
