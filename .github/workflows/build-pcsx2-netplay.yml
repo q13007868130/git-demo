@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - master
-      - "feature/**"
+      - "feature/pcsx2-modern-netplay"
   workflow_dispatch:
 
 concurrency:
@@ -102,16 +102,19 @@ jobs:
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.ps1 src\bin\Collect-Netplay-Diagnostics.ps1 -Force
           Copy-Item control\scripts\Collect-Netplay-Diagnostics.bat src\bin\Collect-Netplay-Diagnostics.bat -Force
           Copy-Item control\NETPLAY_CONTROL_SHA.txt src\bin\NETPLAY_CONTROL_SHA.txt -Force
+          # Keep every Netplay install self-contained. This prevents two PCs from
+          # silently reading different Documents/AppData configurations.
+          New-Item -ItemType File -Force -Path src\bin\portable.txt | Out-Null
           $updaterText = Get-Content control\scripts\Update-Netplay.ps1 -Raw
           $updaterText | Set-Content -Encoding utf8BOM src\bin\Update-Netplay.ps1
           Copy-Item control\scripts\Update-Netplay.bat src\bin\Update-Netplay.bat -Force
           $channel = if ($env:GITHUB_REF -eq "refs/heads/master") { "stable" } else { "test" }
           $channel | Set-Content -Encoding ASCII src\bin\NETPLAY_UPDATE_CHANNEL.txt
           @"
-          PCSX2 Modern Netplay v0.5b-r8 live player/delay/topology controls
+          PCSX2 Modern Netplay - deterministic dual-track build
           =================================================
           Base: current PCSX2 master at build time (exact SHA in PCSX2_UPSTREAM_SHA.txt)
-          Protocol: v6 host-authoritative multiplayer + runtime controller/delay/topology reconfiguration
+          Protocol: startup environment fingerprint + host-authoritative multiplayer + runtime controls
           Transport: reliable TCP
           Default port: 27886/TCP
 
