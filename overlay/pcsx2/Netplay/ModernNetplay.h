@@ -11,6 +11,25 @@ namespace ModernNetplay
 {
     static constexpr std::uint32_t MAX_PLAYERS = 4;
 
+    struct ArcadeJvsState
+    {
+        std::uint32_t mode = 0;
+        std::uint16_t buttons = 0;
+        std::uint16_t coin = 0;
+        std::uint16_t screen_x = 0xffff;
+        std::uint16_t screen_y = 0xffff;
+        std::uint16_t raw_x = 0xffff;
+        std::uint16_t raw_y = 0xffff;
+        std::array<std::uint16_t, 4> drum{};
+        std::array<std::uint16_t, 3> analog{0x8000, 0, 0};
+        std::uint16_t dip_switch_state = 0;
+        std::uint16_t test_state = 0;
+        std::uint16_t flags = 0;
+        std::uint32_t reserved = 0;
+    };
+
+    using ArcadeJvsBundle = std::array<ArcadeJvsState, 2>;
+
     struct PlayerSnapshot
     {
         std::uint32_t id = 0;
@@ -117,6 +136,11 @@ namespace ModernNetplay
     // digital buttons, analog sticks, and all pressure-sensitive buttons.
     std::uint8_t HandlePadResponse(std::uint8_t unified_slot,
         std::uint32_t command_index, std::uint8_t local_value);
+
+    // PCSX2X6/System 246-256 JVS path. Each cabinet connection contributes its
+    // own logical JVS player; the host returns the same authoritative two-player
+    // state to every VM before the emulated JVS board answers the game.
+    bool SynchronizeArcadeJvs(const ArcadeJvsState& local_state, ArcadeJvsBundle* bundle);
 
     void Shutdown();
 } // namespace ModernNetplay

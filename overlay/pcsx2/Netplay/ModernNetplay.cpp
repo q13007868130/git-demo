@@ -13,6 +13,7 @@
 #include "SIO/Memcard/MemoryCardFile.h"
 #include "SIO/Memcard/MemoryCardFolder.h"
 #include "SIO/Pad/Pad.h"
+#include "DEV9/ACJV.h"
 
 #include <algorithm>
 #include <array>
@@ -45,6 +46,7 @@ namespace ModernNetplay
 namespace
 {
     static constexpr std::size_t INPUT_FRAME_BYTES = 18;
+    static constexpr std::size_t ARCADE_JVS_STATE_BYTES = 40;
     using InputFrame = std::array<std::uint8_t, INPUT_FRAME_BYTES>;
     using InputBundle = std::array<InputFrame, MAX_PLAYERS>;
 
@@ -52,7 +54,7 @@ namespace
     constexpr std::uint32_t INPUT_MAGIC = 0x494E5054;   // INPT
     constexpr std::uint32_t BUNDLE_MAGIC = 0x424E444C;  // BNDL
     constexpr std::uint32_t CONTROL_MAGIC = 0x43544C31; // CTL1
-    constexpr std::uint32_t PROTOCOL_VERSION = 9;
+    constexpr std::uint32_t PROTOCOL_VERSION = 10;
     constexpr std::uint16_t DEFAULT_PORT = 27886;
     constexpr int RECEIVE_TIMEOUT_SECONDS = 30;
     constexpr int BOOT_BARRIER_TIMEOUT_SECONDS = 90;
@@ -103,6 +105,8 @@ namespace
         SyncCheckpoint = 18,
         MemcardAbort = 19,
         RoundEnd = 20,
+        ArcadeJvsInput = 21,
+        ArcadeJvsBundle = 22,
     };
 
     struct PlayerState
@@ -125,6 +129,19 @@ namespace
         std::thread receiver;
         std::atomic<bool> connected{false};
     };
+
+    void WriteU16(std::uint8_t* dst, std::uint16_t value)
+    {
+        value = htons(value);
+        std::memcpy(dst, &value, sizeof(value));
+    }
+
+    std::uint16_t ReadU16(const std::uint8_t* src)
+    {
+        std::uint16_t value;
+        std::memcpy(&value, src, sizeof(value));
+        return ntohs(value);
+    }
 
     void WriteU32(std::uint8_t* dst, std::uint32_t value)
     {
@@ -149,6 +166,46 @@ namespace
     {
         return (static_cast<std::uint64_t>(ReadU32(src)) << 32) |
             static_cast<std::uint64_t>(ReadU32(src + 4));
+    }
+
+    void WriteArcadeJvsState(std::uint8_t* dst, const ArcadeJvsState& state)
+    {
+        WriteU32(dst + 0, state.mode);
+        WriteU16(dst + 4, state.buttons);
+        WriteU16(dst + 6, state.coin);
+        WriteU16(dst + 8, state.screen_x);
+        WriteU16(dst + 10, state.screen_y);
+        WriteU16(dst + 12, state.raw_x);
+        WriteU16(dst + 14, state.raw_y);
+        for (std::size_t i = 0; i < state.drum.size(); i++)
+            WriteU16(dst + 16 + i * 2, state.drum[i]);
+        for (std::size_t i = 0; i < state.analog.size(); i++)
+            WriteU16(dst + 24 + i * 2, state.analog[i]);
+        WriteU16(dst + 30, state.dip_switch_state);
+        WriteU16(dst + 32, state.test_state);
+        WriteU16(dst + 34, state.flags);
+        WriteU32(dst + 36, state.reserved);
+    }
+
+    ArcadeJvsState ReadArcadeJvsState(const std::uint8_t* src)
+    {
+        ArcadeJvsState state{};
+        state.mode = ReadU32(src + 0);
+        state.buttons = ReadU16(src + 4);
+        state.coin = ReadU16(src + 6);
+        state.screen_x = ReadU16(src + 8);
+        state.screen_y = ReadU16(src + 10);
+        state.raw_x = ReadU16(src + 12);
+        state.raw_y = ReadU16(src + 14);
+        for (std::size_t i = 0; i < state.drum.size(); i++)
+            state.drum[i] = ReadU16(src + 16 + i * 2);
+        for (std::size_t i = 0; i < state.analog.size(); i++)
+            state.analog[i] = ReadU16(src + 24 + i * 2);
+        state.dip_switch_state = ReadU16(src + 30);
+        state.test_state = ReadU16(src + 32);
+        state.flags = ReadU16(src + 34);
+        state.reserved = ReadU32(src + 36);
+        return state;
     }
 
     std::uint64_t HashBytes(const std::vector<std::uint8_t>& data)
@@ -628,6 +685,10 @@ namespace
         {
             if (m_role == Role::Disabled || command_index < 3 || command_index > 20)
                 return local_value;
+            // System 246/256 games read their controls from JVS/ACJV instead of
+            // the DualShock2 poll path. Do not advance the shared Netplay poll twice.
+            if (ACJV::enabled)
+                return local_value;
 
             const std::size_t input_index = static_cast<std::size_t>(command_index - 3);
             if (unified_slot == 0 && command_index == 3)
@@ -744,6 +805,11 @@ namespace
         bool RequestReturnToLobbyImpl()
         {
             return RequestReturnToLobby();
+        }
+
+        bool SynchronizeArcadeJvsImpl(const ArcadeJvsState& local_state, ArcadeJvsBundle* bundle)
+        {
+            return SynchronizeArcadeJvsInternal(local_state, bundle);
         }
 
     private:
@@ -963,6 +1029,9 @@ namespace
             for (auto& map : m_player_inputs)
                 map.clear();
             m_bundles.clear();
+            for (auto& map : m_arcade_jvs_inputs)
+                map.clear();
+            m_arcade_jvs_bundles.clear();
         }
 
         int SlotToPlayerIndex(std::uint32_t slot) const
@@ -2527,6 +2596,222 @@ namespace
             Host::ReportErrorAsync(desync ? "PCSX2 检测到联机不同步" : "PCSX2 联机已中断", message);
         }
 
+        bool SendArcadeJvsInputToHost(std::uint32_t frame, const ArcadeJvsState& state)
+        {
+            std::array<std::uint8_t, 12 + ARCADE_JVS_STATE_BYTES> payload{};
+            WriteU32(payload.data() + 0, frame);
+            WriteU32(payload.data() + 4, m_local_player_id);
+            WriteU32(payload.data() + 8, m_input_epoch.load(std::memory_order_acquire));
+            WriteArcadeJvsState(payload.data() + 12, state);
+            return SendControlToHost(ControlType::ArcadeJvsInput, payload.data(),
+                static_cast<std::uint32_t>(payload.size()));
+        }
+
+        void BroadcastArcadeJvsBundle(std::uint32_t frame, const ArcadeJvsBundle& bundle)
+        {
+            std::array<std::uint8_t, 12 + (2 * ARCADE_JVS_STATE_BYTES)> payload{};
+            WriteU32(payload.data() + 0, frame);
+            WriteU32(payload.data() + 4, std::min<std::uint32_t>(m_max_players, 2u));
+            WriteU32(payload.data() + 8, m_input_epoch.load(std::memory_order_acquire));
+            WriteArcadeJvsState(payload.data() + 12, bundle[0]);
+            WriteArcadeJvsState(payload.data() + 12 + ARCADE_JVS_STATE_BYTES, bundle[1]);
+            BroadcastControl(ControlType::ArcadeJvsBundle, payload.data(),
+                static_cast<std::uint32_t>(payload.size()));
+        }
+
+        void HandleArcadeJvsInput(Peer& peer, const std::vector<std::uint8_t>& payload)
+        {
+            if (payload.size() != (12 + ARCADE_JVS_STATE_BYTES))
+                return;
+            const std::uint32_t frame = ReadU32(payload.data() + 0);
+            const std::uint32_t player_id = ReadU32(payload.data() + 4);
+            const std::uint32_t epoch = ReadU32(payload.data() + 8);
+            if (player_id != peer.player_id || player_id < 2 || player_id > 2 ||
+                epoch != m_input_epoch.load(std::memory_order_acquire))
+                return;
+            const ArcadeJvsState state = ReadArcadeJvsState(payload.data() + 12);
+            {
+                std::lock_guard<std::mutex> lock(m_input_mutex);
+                m_arcade_jvs_inputs[player_id - 1][frame] = state;
+            }
+            m_input_cv.notify_all();
+        }
+
+        void HandleArcadeJvsBundle(const std::vector<std::uint8_t>& payload)
+        {
+            if (payload.size() != (12 + (2 * ARCADE_JVS_STATE_BYTES)))
+                return;
+            const std::uint32_t frame = ReadU32(payload.data() + 0);
+            const std::uint32_t count = ReadU32(payload.data() + 4);
+            const std::uint32_t epoch = ReadU32(payload.data() + 8);
+            if (count < 1 || count > 2 || epoch != m_input_epoch.load(std::memory_order_acquire))
+                return;
+            ArcadeJvsBundle bundle{};
+            bundle[0] = ReadArcadeJvsState(payload.data() + 12);
+            bundle[1] = ReadArcadeJvsState(payload.data() + 12 + ARCADE_JVS_STATE_BYTES);
+            {
+                std::lock_guard<std::mutex> lock(m_bundle_mutex);
+                m_arcade_jvs_bundles[frame] = bundle;
+            }
+            m_bundle_cv.notify_all();
+        }
+
+        bool WaitForArcadeJvsHostInputs(std::uint32_t frame, ArcadeJvsBundle* bundle)
+        {
+            const auto started = std::chrono::steady_clock::now();
+            std::unique_lock<std::mutex> lock(m_input_mutex);
+            const bool ready = m_input_cv.wait_for(lock, std::chrono::seconds(RECEIVE_TIMEOUT_SECONDS),
+                [this, frame]() {
+                    for (std::uint32_t i = 0; i < m_max_players; i++)
+                    {
+                        if (m_arcade_jvs_inputs[i].find(frame) == m_arcade_jvs_inputs[i].end())
+                            return m_failed.load(std::memory_order_acquire) ||
+                                m_stop_requested.load(std::memory_order_acquire);
+                    }
+                    return true;
+                });
+            const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            LogStall(frame, waited);
+            if (!ready || m_failed.load(std::memory_order_acquire))
+                return false;
+            for (std::uint32_t i = 0; i < m_max_players; i++)
+            {
+                const auto it = m_arcade_jvs_inputs[i].find(frame);
+                if (it == m_arcade_jvs_inputs[i].end())
+                    return false;
+                (*bundle)[i] = it->second;
+            }
+            return true;
+        }
+
+        bool WaitForArcadeJvsBundle(std::uint32_t frame, ArcadeJvsBundle* bundle)
+        {
+            const auto started = std::chrono::steady_clock::now();
+            std::unique_lock<std::mutex> lock(m_bundle_mutex);
+            const bool ready = m_bundle_cv.wait_for(lock, std::chrono::seconds(RECEIVE_TIMEOUT_SECONDS),
+                [this, frame]() {
+                    return m_arcade_jvs_bundles.find(frame) != m_arcade_jvs_bundles.end() ||
+                        m_failed.load(std::memory_order_acquire) ||
+                        m_stop_requested.load(std::memory_order_acquire) ||
+                        !m_connected.load(std::memory_order_acquire);
+                });
+            const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            LogStall(frame, waited);
+            if (!ready)
+                return false;
+            const auto it = m_arcade_jvs_bundles.find(frame);
+            if (it == m_arcade_jvs_bundles.end())
+                return false;
+            *bundle = it->second;
+            return true;
+        }
+
+        void PruneArcadeJvsHistory()
+        {
+            const std::uint32_t delay = m_delay.load(std::memory_order_acquire);
+            const std::uint32_t keep_window = std::max<std::uint32_t>(240u, delay + 180u);
+            if (m_frame < keep_window)
+                return;
+            const std::uint32_t keep_from = m_frame - keep_window;
+            {
+                std::lock_guard<std::mutex> lock(m_input_mutex);
+                for (auto& map : m_arcade_jvs_inputs)
+                {
+                    for (auto it = map.begin(); it != map.end();)
+                        it = (it->first < keep_from) ? map.erase(it) : std::next(it);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_bundle_mutex);
+                for (auto it = m_arcade_jvs_bundles.begin(); it != m_arcade_jvs_bundles.end();)
+                    it = (it->first < keep_from) ? m_arcade_jvs_bundles.erase(it) : std::next(it);
+            }
+        }
+
+        bool SynchronizeArcadeJvsInternal(const ArcadeJvsState& local_state, ArcadeJvsBundle* output)
+        {
+            if (!output || !IsConfigured() || !ACJV::enabled)
+                return false;
+            if (!m_start_committed || !m_connected.load(std::memory_order_acquire))
+                return false;
+            if (m_max_players > 2)
+            {
+                const std::string reason =
+                    "System 246/256 JVS 当前一次只支持 1～2 个联机玩家；请将本局人数设为 2 人以内";
+                if (!m_failed.load(std::memory_order_acquire))
+                {
+                    if (m_role == Role::Host)
+                        BroadcastSessionAbort(reason);
+                    Fail(reason.c_str());
+                }
+                return false;
+            }
+            if (!WaitForFirstPollBarrier())
+                return false;
+
+            ApplyPendingRuntimeConfigIfDue();
+
+            const std::uint32_t input_frame = m_frame;
+            if (m_role == Role::Host)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(m_input_mutex);
+                    m_arcade_jvs_inputs[0][input_frame] = local_state;
+                }
+                m_input_cv.notify_all();
+            }
+            else if (!SendArcadeJvsInputToHost(input_frame, local_state))
+            {
+                Fail("failed to send System 246/256 JVS input");
+                return false;
+            }
+
+            ArcadeJvsBundle authoritative{};
+            authoritative[0].mode = local_state.mode;
+            authoritative[1].mode = local_state.mode;
+
+            const std::uint32_t delay = m_delay.load(std::memory_order_acquire);
+            const std::uint32_t source_frame = (input_frame >= delay) ? (input_frame - delay) : input_frame;
+            if (m_role == Role::Host)
+            {
+                if (!WaitForArcadeJvsHostInputs(source_frame, &authoritative))
+                {
+                    const std::string reason = "等待 System 246/256 JVS 输入超时，联机无法继续保持同步";
+                    BroadcastSessionAbort(reason);
+                    Fail(reason.c_str());
+                    return false;
+                }
+                if ((source_frame % LOG_FRAME_INTERVAL) == 0)
+                    RecordHostSyncCheckpoint(source_frame, static_cast<std::uint64_t>(g_FrameCount));
+                BroadcastArcadeJvsBundle(source_frame, authoritative);
+            }
+            else
+            {
+                if (!WaitForArcadeJvsBundle(source_frame, &authoritative))
+                {
+                    Fail("客户端等待房主 JVS 权威输入超时");
+                    return false;
+                }
+                if ((source_frame % LOG_FRAME_INTERVAL) == 0)
+                    SendClientSyncCheckpoint(source_frame, static_cast<std::uint64_t>(g_FrameCount));
+            }
+
+            *output = authoritative;
+            ++m_frame;
+            m_frame_counter.store(m_frame, std::memory_order_release);
+            if ((source_frame % LOG_FRAME_INTERVAL) == 0)
+                Log("ARCADE_SYNC poll=%u vsync=%llu delay=%u players=%u mode=%u",
+                    static_cast<unsigned>(source_frame),
+                    static_cast<unsigned long long>(g_FrameCount),
+                    static_cast<unsigned>(delay),
+                    static_cast<unsigned>(m_max_players),
+                    static_cast<unsigned>(local_state.mode));
+            PruneArcadeJvsHistory();
+            return true;
+        }
+
         bool SendInputToHost(std::uint32_t frame, const InputFrame& input)
         {
             std::array<std::uint8_t, INPUT_PACKET_SIZE> packet{};
@@ -3055,6 +3340,9 @@ namespace
                     MaybeCommitRuntimeConfig();
                     break;
                 }
+                case ControlType::ArcadeJvsInput:
+                    HandleArcadeJvsInput(peer, payload);
+                    break;
                 case ControlType::SyncCheckpoint:
                     HandlePeerSyncCheckpoint(peer.player_id, payload);
                     break;
@@ -3118,6 +3406,9 @@ namespace
                     Fail(reason.c_str());
                     break;
                 }
+                case ControlType::ArcadeJvsBundle:
+                    HandleArcadeJvsBundle(payload);
+                    break;
                 case ControlType::RuntimeApply:
                 {
                     std::uint32_t change_id = 0;
@@ -3231,6 +3522,8 @@ namespace
         InputBundle m_output_bundle = {NEUTRAL_FRAME, NEUTRAL_FRAME, NEUTRAL_FRAME, NEUTRAL_FRAME};
         std::array<std::unordered_map<std::uint32_t, InputFrame>, MAX_PLAYERS> m_player_inputs;
         std::unordered_map<std::uint32_t, InputBundle> m_bundles;
+        std::array<std::unordered_map<std::uint32_t, ArcadeJvsState>, 2> m_arcade_jvs_inputs;
+        std::unordered_map<std::uint32_t, ArcadeJvsBundle> m_arcade_jvs_bundles;
         std::unordered_map<std::uint32_t, std::uint64_t> m_host_sync_checkpoints;
         std::array<std::uint32_t, MAX_PLAYERS> m_desync_strikes{};
 
@@ -3326,6 +3619,10 @@ std::uint8_t HandlePadResponse(std::uint8_t slot, std::uint32_t index, std::uint
 {
     return GetSession().HandlePadResponse(slot, index, local_value);
 }
+bool SynchronizeArcadeJvs(const ArcadeJvsState& local_state, ArcadeJvsBundle* bundle)
+{
+    return GetSession().SynchronizeArcadeJvsImpl(local_state, bundle);
+}
 void Shutdown() { GetSession().Stop(); }
 #else
 bool IsCustomBuild() { return true; }
@@ -3347,6 +3644,7 @@ void ApplyDeterministicConfig() {}
 bool ShouldForceDualShock2Slot(std::uint32_t) { return false; }
 bool ShouldDisconnectControllerSlot(std::uint32_t) { return false; }
 std::uint8_t HandlePadResponse(std::uint8_t, std::uint32_t, std::uint8_t local_value) { return local_value; }
+bool SynchronizeArcadeJvs(const ArcadeJvsState&, ArcadeJvsBundle*) { return false; }
 void Shutdown() {}
 #endif
 } // namespace ModernNetplay
