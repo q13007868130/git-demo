@@ -413,11 +413,11 @@ namespace
             if (error) *error = "无法读取街机 CHD/DVD/HDD 镜像";
             return false;
         }
-        if (!HashFile64(paths.dongle, &fp.dongle))
-        {
-            if (error) *error = "无法读取街机 Dongle：" + paths.dongle_name;
-            return false;
-        }
+        // The security dongle is host-authoritative session state, like SRAM:
+        // record a local hash for diagnostics, but do not require the client to
+        // already own an identical copy. The host copy is transferred into a
+        // Netplay shadow dongle before PREPARE_BOOT.
+        fp.dongle = HashOptionalFile64(paths.dongle);
         fp.game_settings = HashOptionalFile64(paths.game_settings);
         *out = fp;
         return true;
@@ -440,7 +440,8 @@ namespace
         {
             if (host.arcade_manifest != local.arcade_manifest) add(".acgame");
             if (host.boot != local.boot) add("boot.elf");
-            if (host.dongle != local.dongle) add("Dongle");
+            // Dongle and SRAM are synchronized from the host into session
+            // shadows, therefore local pre-session contents are not blockers.
         }
         return reason;
     }
