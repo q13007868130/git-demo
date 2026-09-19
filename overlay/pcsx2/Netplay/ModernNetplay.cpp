@@ -535,7 +535,7 @@ namespace
             std::string fingerprint_error;
             if (!BuildDeterminismFingerprint(path, serial, crc, &fingerprint, &fingerprint_error))
             {
-                SetLastError(fingerprint_error);
+                SetLastError(fingerprint_error.c_str());
                 Log("determinism fingerprint failed: %s", fingerprint_error.c_str());
                 return false;
             }
