@@ -193,6 +193,8 @@ void NetplayDialog::buildSetupUi()
 
     m_memcard_sync = new QCheckBox(tr("同步房主存档/街机状态（PS2 记忆卡；X6 Dongle + SRAM，均使用临时副本）"), host_tab);
     m_memcard_sync->setChecked(true);
+    m_memcard_sync->setEnabled(false);
+    m_memcard_sync->setToolTip(tr("PCSX2X6 联机固定启用状态同步：普通 PS2 同步记忆卡；System 246/256 同步 Dongle + SRAM。"));
     host_form->addRow(QString(), m_memcard_sync);
 
     auto* host_note = new QLabel(tr("3～4 人房间会自动在 2 号手柄端口启用 Multitap，保持 P1/P2 与双人模式一致，P3/P4 使用扩展槽位。游戏开始后会锁定房间，普通 PS2 会校验完整启动环境；System 246/256 还会校验 GameIndex、.acgame、游戏INI、boot.elf、媒体和 Dongle。"), host_tab);
