@@ -48,11 +48,22 @@ namespace
     using InputFrame = std::array<std::uint8_t, INPUT_FRAME_BYTES>;
     using InputBundle = std::array<InputFrame, MAX_PLAYERS>;
 
+    struct DeterminismFingerprint
+    {
+        std::uint64_t build = 0;
+        std::uint64_t bios = 0;
+        std::uint64_t gamedb = 0;
+        std::uint64_t game_settings = 0;
+        std::uint64_t media = 0;
+    };
+
+    static constexpr std::size_t GAME_MANIFEST_SIZE = 4 + 32 + 160 + (5 * 8);
+
     constexpr std::uint32_t HELLO_MAGIC = 0x50324E50;   // P2NP
     constexpr std::uint32_t INPUT_MAGIC = 0x494E5054;   // INPT
     constexpr std::uint32_t BUNDLE_MAGIC = 0x424E444C;  // BNDL
     constexpr std::uint32_t CONTROL_MAGIC = 0x43544C31; // CTL1
-    constexpr std::uint32_t PROTOCOL_VERSION = 9;
+    constexpr std::uint32_t PROTOCOL_VERSION = 10;
     constexpr std::uint16_t DEFAULT_PORT = 27886;
     constexpr int RECEIVE_TIMEOUT_SECONDS = 30;
     constexpr int BOOT_BARRIER_TIMEOUT_SECONDS = 90;
@@ -160,6 +171,128 @@ namespace
             hash *= 1099511628211ull;
         }
         return hash;
+    }
+
+    bool HashFile64(const std::string& path, std::uint64_t* out_hash)
+    {
+        if (!out_hash || path.empty())
+            return false;
+
+        auto file = FileSystem::OpenManagedCFile(path.c_str(), "rb");
+        if (!file)
+            return false;
+
+        std::uint64_t hash = 1469598103934665603ull;
+        std::array<std::uint8_t, 1024 * 1024> buffer{};
+        for (;;)
+        {
+            const std::size_t count = std::fread(buffer.data(), 1, buffer.size(), file.get());
+            for (std::size_t i = 0; i < count; i++)
+            {
+                hash ^= buffer[i];
+                hash *= 1099511628211ull;
+            }
+            if (count < buffer.size())
+            {
+                if (std::ferror(file.get()))
+                    return false;
+                break;
+            }
+        }
+
+        *out_hash = hash;
+        return true;
+    }
+
+    std::uint64_t HashOptionalFile64(const std::string& path)
+    {
+        std::uint64_t hash = 0;
+        if (!path.empty() && FileSystem::FileExists(path.c_str()))
+            HashFile64(path, &hash);
+        return hash;
+    }
+
+    std::uint64_t MixHash64(std::uint64_t seed, std::uint64_t value)
+    {
+        return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2));
+    }
+
+    std::string ResolveGameSettingsPath(const std::string& serial, std::uint32_t crc)
+    {
+        std::string path = VMManager::GetGameSettingsPath(serial, crc);
+        if (FileSystem::FileExists(path.c_str()))
+            return path;
+
+        if (!serial.empty())
+        {
+            path = VMManager::GetGameSettingsPath(serial, 0);
+            if (FileSystem::FileExists(path.c_str()))
+                return path;
+        }
+
+        path = VMManager::GetGameSettingsPath({}, crc);
+        return FileSystem::FileExists(path.c_str()) ? path : std::string();
+    }
+
+    bool BuildDeterminismFingerprint(const std::string& media_path, const std::string& serial,
+        std::uint32_t crc, DeterminismFingerprint* out, std::string* error)
+    {
+        if (!out)
+            return false;
+
+        DeterminismFingerprint fp{};
+
+        const std::string upstream_sha = Path::Combine(EmuFolders::AppRoot, "PCSX2_UPSTREAM_SHA.txt");
+        const std::string control_sha = Path::Combine(EmuFolders::AppRoot, "NETPLAY_CONTROL_SHA.txt");
+        const std::uint64_t upstream_hash = HashOptionalFile64(upstream_sha);
+        const std::uint64_t control_hash = HashOptionalFile64(control_sha);
+        fp.build = MixHash64(upstream_hash, control_hash);
+        if (upstream_hash == 0 || control_hash == 0)
+        {
+            if (error) *error = "缺少联机版本标识文件，请重新下载完整联机包";
+            return false;
+        }
+
+        const std::string bios_path = EmuConfig.FullpathToBios();
+        if (!HashFile64(bios_path, &fp.bios))
+        {
+            if (error) *error = "无法读取当前 BIOS，无法校验联机环境";
+            return false;
+        }
+
+        const std::string gamedb_path = Path::Combine(EmuFolders::Resources, "GameIndex.yaml");
+        if (!HashFile64(gamedb_path, &fp.gamedb))
+        {
+            if (error) *error = "无法读取 resources/GameIndex.yaml";
+            return false;
+        }
+
+        fp.game_settings = HashOptionalFile64(ResolveGameSettingsPath(serial, crc));
+
+        if (!HashFile64(media_path, &fp.media))
+        {
+            if (error) *error = "无法读取所选游戏镜像进行联机一致性校验";
+            return false;
+        }
+
+        *out = fp;
+        return true;
+    }
+
+    std::string DescribeFingerprintMismatch(const DeterminismFingerprint& host,
+        const DeterminismFingerprint& local)
+    {
+        std::string reason;
+        const auto add = [&reason](const char* name) {
+            if (!reason.empty()) reason += "、";
+            reason += name;
+        };
+        if (host.build != local.build) add("联机/PCSX2版本");
+        if (host.bios != local.bios) add("BIOS");
+        if (host.gamedb != local.gamedb) add("GameIndex.yaml");
+        if (host.game_settings != local.game_settings) add("游戏专用INI");
+        if (host.media != local.media) add("游戏镜像");
+        return reason;
     }
 
     bool SendAll(SOCKET socket, const void* data, std::size_t size)
@@ -398,6 +531,15 @@ namespace
                 VMManager::HasValidVM())
                 return false;
 
+            DeterminismFingerprint fingerprint{};
+            std::string fingerprint_error;
+            if (!BuildDeterminismFingerprint(path, serial, crc, &fingerprint, &fingerprint_error))
+            {
+                SetLastError(fingerprint_error);
+                Log("determinism fingerprint failed: %s", fingerprint_error.c_str());
+                return false;
+            }
+
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 if (m_prepare_boot || RoomConnectedCountLocked() != m_room_capacity)
@@ -412,13 +554,20 @@ namespace
                 m_game_serial = serial;
                 m_game_crc = crc;
                 m_local_game_path = path;
+                m_game_fingerprint = fingerprint;
                 m_last_error.clear();
                 ResetStartStateLocked();
                 for (std::uint32_t i = 0; i < MAX_PLAYERS; i++)
                     m_players[i].game_match = (i == 0 && i < m_max_players);
             }
 
-            Log("host selected game: title=%s serial=%s crc=%08X", title.c_str(), serial.c_str(), crc);
+            Log("host selected game: title=%s serial=%s crc=%08X build=%016llX bios=%016llX gamedb=%016llX gameini=%016llX media=%016llX",
+                title.c_str(), serial.c_str(), crc,
+                static_cast<unsigned long long>(fingerprint.build),
+                static_cast<unsigned long long>(fingerprint.bios),
+                static_cast<unsigned long long>(fingerprint.gamedb),
+                static_cast<unsigned long long>(fingerprint.game_settings),
+                static_cast<unsigned long long>(fingerprint.media));
             BroadcastRoster();
             if (!BroadcastGameManifest())
             {
@@ -1405,7 +1554,7 @@ namespace
             BroadcastControl(ControlType::Roster, payload.data(), static_cast<std::uint32_t>(payload.size()));
         }
 
-        bool BuildGameManifest(std::array<std::uint8_t, 4 + 32 + 160>* payload) const
+        bool BuildGameManifest(std::array<std::uint8_t, GAME_MANIFEST_SIZE>* payload) const
         {
             std::lock_guard<std::mutex> lock(m_state_mutex);
             if (!m_game_selected)
@@ -1414,6 +1563,11 @@ namespace
             WriteU32(payload->data(), m_game_crc);
             std::snprintf(reinterpret_cast<char*>(payload->data() + 4), 32, "%s", m_game_serial.c_str());
             std::snprintf(reinterpret_cast<char*>(payload->data() + 36), 160, "%s", m_game_title.c_str());
+            WriteU64(payload->data() + 196, m_game_fingerprint.build);
+            WriteU64(payload->data() + 204, m_game_fingerprint.bios);
+            WriteU64(payload->data() + 212, m_game_fingerprint.gamedb);
+            WriteU64(payload->data() + 220, m_game_fingerprint.game_settings);
+            WriteU64(payload->data() + 228, m_game_fingerprint.media);
             return true;
         }
 
@@ -1421,7 +1575,7 @@ namespace
         {
             if (m_max_players == 1)
                 return true;
-            std::array<std::uint8_t, 4 + 32 + 160> payload{};
+            std::array<std::uint8_t, GAME_MANIFEST_SIZE> payload{};
             if (!BuildGameManifest(&payload))
                 return false;
             BroadcastControl(ControlType::GameManifest, payload.data(), static_cast<std::uint32_t>(payload.size()));
@@ -1430,7 +1584,7 @@ namespace
 
         bool SendGameManifestToPeer(Peer& peer)
         {
-            std::array<std::uint8_t, 4 + 32 + 160> payload{};
+            std::array<std::uint8_t, GAME_MANIFEST_SIZE> payload{};
             if (!BuildGameManifest(&payload))
                 return false;
             return SendControlToPeer(peer, ControlType::GameManifest, payload.data(), static_cast<std::uint32_t>(payload.size()));
@@ -1473,7 +1627,7 @@ namespace
 
         void HandleGameManifest(const std::vector<std::uint8_t>& payload)
         {
-            if (m_role != Role::Client || payload.size() != (4 + 32 + 160))
+            if (m_role != Role::Client || payload.size() != GAME_MANIFEST_SIZE)
                 return;
             const std::uint32_t crc = ReadU32(payload.data());
             const char* serial_ptr = reinterpret_cast<const char*>(payload.data() + 4);
@@ -1487,6 +1641,13 @@ namespace
             const std::string serial(serial_ptr, serial_len);
             const std::string title(title_ptr, title_len);
 
+            DeterminismFingerprint host_fp{};
+            host_fp.build = ReadU64(payload.data() + 196);
+            host_fp.bios = ReadU64(payload.data() + 204);
+            host_fp.gamedb = ReadU64(payload.data() + 212);
+            host_fp.game_settings = ReadU64(payload.data() + 220);
+            host_fp.media = ReadU64(payload.data() + 228);
+
             std::string local_path;
             {
                 auto lock = GameList::GetLock();
@@ -1494,7 +1655,22 @@ namespace
                 if (entry)
                     local_path = entry->path;
             }
-            const bool matched = !local_path.empty();
+
+            DeterminismFingerprint local_fp{};
+            std::string fingerprint_error;
+            bool matched = !local_path.empty() &&
+                BuildDeterminismFingerprint(local_path, serial, crc, &local_fp, &fingerprint_error);
+            std::string mismatch;
+            if (matched)
+            {
+                mismatch = DescribeFingerprintMismatch(host_fp, local_fp);
+                matched = mismatch.empty();
+            }
+            else if (fingerprint_error.empty())
+            {
+                fingerprint_error = "本机没有找到相同 Serial + CRC 的游戏";
+            }
+
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
                 m_game_selected = true;
@@ -1502,9 +1678,11 @@ namespace
                 m_game_serial = serial;
                 m_game_crc = crc;
                 m_local_game_path = local_path;
+                m_game_fingerprint = host_fp;
                 m_local_game_match = matched;
-                m_last_error.clear();
                 ResetStartStateLocked();
+                m_last_error = matched ? std::string() :
+                    ("联机启动环境不一致：" + (!mismatch.empty() ? mismatch : fingerprint_error));
                 if (m_local_player_id >= 1 && m_local_player_id <= MAX_PLAYERS)
                     m_players[m_local_player_id - 1].game_match = matched;
                 m_players[0].game_match = true;
@@ -1513,8 +1691,9 @@ namespace
             WriteU32(reply.data(), m_local_player_id);
             WriteU32(reply.data() + 4, matched ? 1u : 0u);
             SendControlToHost(ControlType::GameMatch, reply.data(), static_cast<std::uint32_t>(reply.size()));
-            Log("GAME_MANIFEST: title=%s serial=%s crc=%08X local_match=%s",
-                title.c_str(), serial.c_str(), crc, matched ? "yes" : "no");
+            Log("GAME_MANIFEST: title=%s serial=%s crc=%08X local_match=%s mismatch=%s",
+                title.c_str(), serial.c_str(), crc, matched ? "yes" : "no",
+                mismatch.empty() ? fingerprint_error.c_str() : mismatch.c_str());
         }
 
         bool ExportConfiguredMemoryCard(std::vector<std::uint8_t>* data, bool* present, std::string* error)
@@ -3199,6 +3378,7 @@ namespace
         std::string m_game_serial;
         std::uint32_t m_game_crc = 0;
         std::string m_local_game_path;
+        DeterminismFingerprint m_game_fingerprint{};
 
         bool m_start_requested = false;
         bool m_memcard_transfer_started = false;
