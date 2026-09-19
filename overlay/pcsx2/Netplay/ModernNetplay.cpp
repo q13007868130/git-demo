@@ -2997,8 +2997,12 @@ namespace
 
         void ReturnToLobbyLocal(const char* reason)
         {
+            std::string shadow_to_remove;
+            std::string shadow_sram_to_remove;
             {
                 std::lock_guard<std::mutex> lock(m_state_mutex);
+                shadow_to_remove = m_shadow_card_filename;
+                shadow_sram_to_remove = m_shadow_arcade_sram_path;
                 m_game_switching = true;
                 m_round_in_progress = false;
                 m_game_selected = false;
@@ -3018,6 +3022,11 @@ namespace
                 }
                 m_last_error = reason ? reason : "已返回联机房间";
             }
+            if (!shadow_to_remove.empty())
+                FileSystem::DeleteFilePath(Path::Combine(EmuFolders::MemoryCards, shadow_to_remove).c_str());
+            if (!shadow_sram_to_remove.empty())
+                FileSystem::DeleteFilePath(shadow_sram_to_remove.c_str());
+
             std::uint32_t epoch = m_input_epoch.fetch_add(1, std::memory_order_acq_rel) + 1u;
             if (epoch == 0)
                 m_input_epoch.store(1, std::memory_order_release);
