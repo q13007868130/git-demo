@@ -29,7 +29,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: PS2Homebrew-arcade/pcsx2x6
-          ref: master
+          # Current upstream master when the JVS adapter was audited.
+          # Keep this reproducible until the adapter is revalidated against a newer x6 commit.
+          ref: 583f0e90907d69bb2db670f570d0865260fcc71b
           submodules: recursive
           fetch-depth: 0
           path: src
@@ -52,7 +54,7 @@ jobs:
           Copy-Item control\overlay-pcsx2x6\pcsx2\DEV9\ACJV.cpp src\pcsx2\DEV9\ACJV.cpp -Force
           & control\scripts\apply-pcsx2x6-netplay.ps1 -SourceRoot (Resolve-Path src)
           git -C src diff --check
-          git -C src diff -- pcsx2/SIO/Pad/Pad.cpp pcsx2/SIO/Pad/PadDualshock2.cpp pcsx2/VMManager.cpp pcsx2/Patch.cpp pcsx2/CMakeLists.txt pcsx2-qt/MainWindow.cpp pcsx2-qt/AutoUpdaterDialog.cpp pcsx2-qt/QtHost.cpp pcsx2-qt/CMakeLists.txt
+          git -C src diff -- pcsx2/SIO/Pad/Pad.cpp pcsx2/SIO/Pad/PadDualshock2.cpp pcsx2/DEV9/ACJV.cpp pcsx2/VMManager.cpp pcsx2/Patch.cpp pcsx2/CMakeLists.txt pcsx2-qt/MainWindow.cpp pcsx2-qt/AutoUpdaterDialog.cpp pcsx2-qt/QtHost.cpp pcsx2-qt/CMakeLists.txt
 
       - name: Restore PCSX2X6 Windows dependencies
         id: cache-deps
