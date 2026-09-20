@@ -183,7 +183,10 @@ namespace
             return false;
 
         std::uint64_t hash = 1469598103934665603ull;
-        std::array<std::uint8_t, 1024 * 1024> buffer{};
+        // Keep the 1 MiB I/O buffer on the heap. A 1 MiB local std::array can
+        // exhaust the default Windows thread stack and hard-crash the host
+        // before the selected-game log is written.
+        std::vector<std::uint8_t> buffer(1024 * 1024);
         for (;;)
         {
             const std::size_t count = std::fread(buffer.data(), 1, buffer.size(), file.get());
